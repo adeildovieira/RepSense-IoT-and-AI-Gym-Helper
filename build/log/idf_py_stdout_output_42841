@@ -1,0 +1,113 @@
+Command: /Users/adeildovieira/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/adeildovieira/esp/esp-idf/tools/idf_monitor.py -p /dev/cu.usbmodem101 -b 115200 --toolchain-prefix xtensa-esp32s3-elf- --target esp32s3 --revision 0 /Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/esp32_openwrathermap.elf /Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader/bootloader.elf -m '/Users/adeildovieira/.espressif/python_env/idf5.5_py3.9_env/bin/python' '/Users/adeildovieira/esp/esp-idf/tools/idf.py' '-p' '/dev/cu.usbmodem101'
+[0;32mI (336) cpu_start: Multicore app[0m
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0xb (SPI_FAST_FLASH_BOOT)
+Saved PC:0x40041a76
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x159c
+load:0x403c8700,len:0xd24
+load:0x403cb700,len:0x2f48
+entry 0x403c8924
+[0;32mI (18) boot: ESP-IDF v5.5 2nd stage bootloader[0m
+[0;32mI (18) boot: compile time Oct 18 2025 20:26:58[0m
+[0;32mI (18) boot: Multicore bootloader[0m
+[0;32mI (18) boot: chip revision: v0.2[0m
+[0;32mI (21) boot: efuse block revision: v1.3[0m
+[0;32mI (24) boot.esp32s3: Boot SPI Speed : 80MHz[0m
+[0;32mI (28) boot.esp32s3: SPI Mode       : DIO[0m
+[0;32mI (32) boot.esp32s3: SPI Flash Size : 16MB[0m
+[0;32mI (36) boot: Enabling RNG early entropy source...[0m
+[0;32mI (40) boot: Partition Table:[0m
+[0;32mI (43) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (49) boot:  0 nvs              WiFi data        01 02 00009000 00006000[0m
+[0;32mI (56) boot:  1 phy_init         RF data          01 01 0000f000 00001000[0m
+[0;32mI (62) boot:  2 factory          factory app      00 00 00010000 00177000[0m
+[0;32mI (69) boot: End of partition table[0m
+[0;32mI (72) esp_image: segment 0: paddr=00010020 vaddr=3c0f0020 size=37e28h (228904) map[0m
+[0;32mI (120) esp_image: segment 1: paddr=00047e50 vaddr=3fc9cf00 size=04bd8h ( 19416) load[0m
+[0;32mI (124) esp_image: segment 2: paddr=0004ca30 vaddr=40374000 size=035e8h ( 13800) load[0m
+[0;32mI (128) esp_image: segment 3: paddr=00050020 vaddr=42000020 size=e25fch (927228) map[0m
+[0;32mI (295) esp_image: segment 4: paddr=00132624 vaddr=403775e8 size=15894h ( 88212) load[0m
+[0;32mI (314) esp_image: segment 5: paddr=00147ec0 vaddr=600fe000 size=00020h (    32) load[0m
+[0;32mI (324) boot: Loaded app from partition at offset 0x10000[0m
+[0;32mI (324) boot: Disabling RNG early entropy source...[0m
+[0;32mI (335) cpu_start: Multicore app[0m
+[0;32mI (344) cpu_start: Pro cpu start user code[0m
+[0;32mI (344) cpu_start: cpu freq: 160000000 Hz[0m
+[0;32mI (344) app_init: Application information:[0m
+[0;32mI (344) app_init: Project name:     esp32_openwrathermap[0m
+[0;32mI (349) app_init: App version:      6d38fa0-dirty[0m
+[0;32mI (353) app_init: Compile time:     Oct 18 2025 20:26:51[0m
+[0;32mI (358) app_init: ELF file SHA256:  011a3bfae...[0m
+[0;32mI (363) app_init: ESP-IDF:          v5.5[0m
+[0;32mI (366) efuse_init: Min chip rev:     v0.0[0m
+[0;32mI (370) efuse_init: Max chip rev:     v0.99 [0m
+[0;32mI (374) efuse_init: Chip rev:         v0.2[0m
+[0;32mI (378) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (384) heap_init: At 3FCB6140 len 000335D0 (205 KiB): RAM[0m
+[0;32mI (390) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM[0m
+[0;32mI (395) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM[0m
+[0;32mI (400) heap_init: At 600FE020 len 00001FC8 (7 KiB): RTCRAM[0m
+[0;32mI (406) spi_flash: detected chip: gd[0m
+[0;32mI (408) spi_flash: flash io: dio[0m
+[0;32mI (412) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (418) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (425) main_task: Started on CPU0[0m
+[0;32mI (435) main_task: Calling app_main()[0m
+[0;32mI (455) lab4_task4: Initialize SPI bus[0m
+[0;32mI (455) lab4_task4: Install panel IO[0m
+[0;32mI (455) lab4_task4: Install ILI9341 panel driver[0m
+[0;32mI (455) ili9341: LCD panel create success, version: 1.2.0[0m
+[0;32mI (575) lab4_task4: Turn on LCD backlight[0m
+[0;32mI (575) lab4_task4: Initialize LVGL[0m
+[0;32mI (575) LVGL: Starting LVGL task[0m
+[0;32mI (625) pp: pp rom version: e7ae62f[0m
+[0;32mI (625) net80211: net80211 rom version: e7ae62f[0m
+[0;32mI (635) wifi:wifi driver task: 3fcc62fc, prio:23, stack:6656, core=0[0m
+[0;32mI (645) wifi:wifi firmware version: f3dbad7[0m
+[0;32mI (645) wifi:wifi certification version: v7.0[0m
+[0;32mI (645) wifi:config NVS flash: enabled[0m
+[0;32mI (645) wifi:config nano formatting: disabled[0m
+[0;32mI (645) wifi:Init data frame dynamic rx buffer num: 32[0m
+[0;32mI (655) wifi:Init static rx mgmt buffer num: 5[0m
+[0;32mI (655) wifi:Init management short buffer num: 32[0m
+[0;32mI (665) wifi:Init dynamic tx buffer num: 32[0m
+[0;32mI (665) wifi:Init static tx FG buffer num: 2[0m
+[0;32mI (665) wifi:Init static rx buffer size: 1600[0m
+[0;32mI (675) wifi:Init static rx buffer num: 10[0m
+[0;32mI (675) wifi:Init dynamic rx buffer num: 32[0m
+[0;32mI (685) wifi_init: rx ba win: 6[0m
+[0;32mI (685) main_task: Returned from app_main()[0m
+[0;32mI (685) wifi_init: accept mbox: 6[0m
+[0;32mI (695) wifi_init: tcpip mbox: 32[0m
+[0;32mI (695) wifi_init: udp mbox: 6[0m
+[0;32mI (695) wifi_init: tcp mbox: 6[0m
+[0;32mI (695) wifi_init: tcp tx win: 5760[0m
+[0;32mI (705) wifi_init: tcp rx win: 5760[0m
+[0;32mI (705) wifi_init: tcp mss: 1440[0m
+[0;32mI (705) wifi_init: WiFi IRAM OP enabled[0m
+[0;32mI (715) wifi_init: WiFi RX IRAM OP enabled[0m
+[0;32mI (715) phy_init: phy_version 701,f4f1da3a,Mar  3 2025,15:50:10[0m
+[0;32mI (755) wifi:mode : sta (24:ec:4a:52:c9:18)[0m
+[0;32mI (755) wifi:enable tsf[0m
+[0;32mI (765) wifi:new:<6,0>, old:<1,0>, ap:<255,255>, sta:<6,0>, prof:1, snd_ch_cfg:0x0[0m
+[0;32mI (765) wifi:state: init -> auth (0xb0)[0m
+[0;32mI (775) wifi:state: auth -> assoc (0x0)[0m
+[0;32mI (785) wifi:state: assoc -> run (0x10)[0m
+[0;32mI (875) wifi:connected with iPhone, aid = 1, channel 6, BW20, bssid = 4a:ae:57:cf:d3:e3[0m
+[0;32mI (875) wifi:security: WPA2-PSK, phy: bgn, rssi: -56[0m
+[0;32mI (875) wifi:pm start, type: 1[0m
+
+[0;32mI (875) wifi:dp: 1, bi: 102400, li: 3, scale listen interval from 307200 us to 307200 us[0m
+[0;32mI (885) wifi:set rx beacon pti, rx_bcn_pti: 0, bcn_timeout: 25000, mt_pti: 0, mt_time: 10000[0m
+[0;32mI (915) wifi:AP's beacon interval = 102400 us, DTIM period = 1[0m
+[0;32mI (2035) esp_netif_handlers: sta ip: 172.20.10.10, mask: 255.255.255.240, gw: 172.20.10.1[0m
+[0;32mI (2035) lab4_task4: Connected to Wi-Fi SSID:iPhone[0m
+[0;32mI (2035) lab4_task4: Fetching weather from URL: https://api.openweathermap.org/data/3.0/onecall?lat=36.00&lon=-78.90&units=metric&exclude=minutely,hourly,daily,alerts&appid=131275931abf448c816713b9ae60f3ec[0m
+[0;32mI (2055) wifi:<ba-add>idx:0 (ifx:0, 4a:ae:57:cf:d3:e3), tid:0, ssn:2, winSize:64[0m
+[0;32mI (2855) esp-x509-crt-bundle: Certificate validated[0m
+[0;33mW (4305) HTTP_CLIENT: This request requires authentication, but does not provide header information for that[0m
+[1;31mE (4305) HTTP_CLIENT: Error response[0m
+[1;31mE (4305) lab4_task4: HTTP GET request failed: ESP_ERR_NOT_SUPPORTED[0m

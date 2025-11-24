@@ -1,0 +1,9 @@
+Command: /Users/adeildovieira/.espressif/python_env/idf5.5_py3.9_env/bin/python /Users/adeildovieira/esp/esp-idf/tools/idf_monitor.py -p /dev/cu.usbmodem101 -b 115200 --toolchain-prefix xtensa-esp32s3-elf- --target esp32s3 --revision 0 /Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/esp32_openwrathermap.elf /Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader/bootloader.elf -m '/Users/adeildovieira/.espressif/python_env/idf5.5_py3.9_env/bin/python' '/Users/adeildovieira/esp/esp-idf/tools/idf.py' '-p' '/dev/cu.usbmodem101'
+[0;33m--- esp-idf-monitor 1.8.0 on /dev/cu.usbmodem101 115200[0m
+[0;33m--- Quit: Ctrl+] | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H[0m
+[0m--- 0x40048c2b: [0;33muart_tx_flush[0m[0m in [0;32mROM[0m
+[0m--- 0x403c8700: [0;33m_stext[0m[0m at [0;32m??[0m[0m:[1;31m?[0m
+[0m--- 0x403c8924: [0;33mcall_start_cpu0[0m[0m at [0;32m/Users/adeildovieira/esp/esp-idf/components/bootloader/subproject/main/bootloader_start.c[0m[0m:[1;31m25[0m
+[1;31m--- Error: read failed: [Errno 6] Device not configured[0m
+[0;33m--- Waiting for the device to reconnect[0m[0;33m[0m
+[0m

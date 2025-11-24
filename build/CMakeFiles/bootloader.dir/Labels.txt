@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/CMakeFiles/bootloader
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/CMakeFiles/bootloader.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/CMakeFiles/bootloader-complete.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/adeildovieira/Downloads/ECE-655-LABS/ECE-COMPSCI-655/lab4_task4/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
