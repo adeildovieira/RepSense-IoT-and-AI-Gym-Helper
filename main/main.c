@@ -1,9 +1,14 @@
-// main.c – RepSense (ESP32-S3-BOX-3 + Grove IMU 9DoF)
-// Display init matches Lab 4 style (esp32s3_box_lcd_config.h).
-// START/STOP via physical button (no touch).
+// main.c – RepSense Lite
+// ESP32-S3-BOX-3 + Grove IMU 9DOF (0x68)
+// Bench press rep counter using vertical acceleration (relative to gravity)
+//
+// - Display init matches Lab 4 (esp32s3_box_lcd_config.h).
+// - I2C IMU on SCL=GPIO40, SDA=GPIO41.
+// - Button on GPIO10 toggles START/STOP.
+// - Calibrates gravity direction, uses vertical accel for reps.
+// - Minimal UI: status, time, reps (no ROM / no sample buffer).
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -13,7 +18,6 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
-#include "nvs_flash.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -22,24 +26,27 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lvgl_port.h"
-
 #include "lvgl.h"
+
 #include "esp32s3_box_lcd_config.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 static const char *TAG = "RepSense";
 
 // -------------------- I2C / IMU DEFINES --------------------
 
-#define I2C_MASTER_SCL_IO          40          // wired SCL on BREAD
-#define I2C_MASTER_SDA_IO          41          // wired SDA on BREAD
+#define I2C_MASTER_SCL_IO          40
+#define I2C_MASTER_SDA_IO          41
 #define I2C_MASTER_NUM             I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ         400000
 #define I2C_MASTER_TIMEOUT_MS      100
 
-// Grove IMU 9DoF (ICM-20600) I2C address (AD0=1 -> 0x69, AD0=0 -> 0x68)
-#define ICM20600_ADDR              0x69
+#define IMU_ADDR_DEFAULT           0x68
 
-// ICM-20600 registers (from datasheet)
+// IMU registers (ICM/MPU family)
 #define REG_SMPLRT_DIV             0x19
 #define REG_CONFIG                 0x1A
 #define REG_GYRO_CONFIG            0x1B
@@ -49,76 +56,65 @@ static const char *TAG = "RepSense";
 #define REG_WHO_AM_I               0x75
 #define REG_ACCEL_XOUT_H           0x3B
 
-// Accel scale: ±4 g -> 8192 LSB/g
+// Accel scale: assume ±4 g -> 8192 LSB/g
 #define ACCEL_LSB_PER_G_4G         8192.0f
 
 // -------------------- BUTTON GPIO --------------------
 
-// Change this if your physical button is on another pin.
-#define BUTTON_GPIO                0
+#define BUTTON_GPIO                10
 
-// -------------------- REP / SAMPLING PARAMS --------------------
+// -------------------- SAMPLING / SESSION PARAMS --------------------
 
-#define SAMPLE_RATE_HZ                 100
-#define SAMPLE_PERIOD_MS               (1000 / SAMPLE_RATE_HZ)
+#define SAMPLE_RATE_HZ             100
+#define SAMPLE_PERIOD_MS           (1000 / SAMPLE_RATE_HZ)
 
-#define CALIB_SAMPLES                  100
-#define MOTION_START_THRESH_DEG        3.0f
-#define DIRECTION_CHANGE_THRESH_DEG    2.0f
-#define ROM_MIN_ANGLE_DEG              5.0f
+#define CALIB_SAMPLES              100   // ~1 s of calibration at 100 Hz
 
-#define MAX_SESSION_SECONDS            60
-#define MAX_SAMPLES   (SAMPLE_RATE_HZ * MAX_SESSION_SECONDS)
+// Vertical-accel based rep detection (bench press)
+#define VERT_SIGN_DEADZONE_G       0.02f   // ignore tiny noise
+#define VERT_MOTION_THRESH_G       0.02f   // start rep if |a_vert| >= this
+#define VERT_RETURN_THRESH_G       0.02f   // "back to baseline" if |a_vert| <= this
+
+// New: rep must reach at least this peak vertical accel to be valid
+#define VERT_PEAK_MIN_G            0.075f   // require >= 0.075 g at some point in the rep
+
+// If you really want a ROM threshold, we’d need angle; here we focus on reps only.
 
 // -------------------- GLOBAL SESSION STATE --------------------
 
-typedef struct {
-    uint32_t t_ms;
-    float angle_deg;
-    float ax_g, ay_g, az_g;
-} sample_t;
+static volatile bool     session_running   = false;
+static volatile int64_t  session_start_us  = 0;
 
-static sample_t samples[MAX_SAMPLES];
-static size_t   sample_count = 0;
+// Baseline gravity
+static volatile bool  baseline_ready       = false;
+static float          baseline_acc_g       = 0.0f;   // |g0|
+static float          g_unit_x             = 0.0f;
+static float          g_unit_y             = 0.0f;
+static float          g_unit_z             = 0.0f;
 
-static volatile bool     session_running = false;
-static volatile int64_t  session_start_us = 0;
+// Rep statistics
+static int   rep_count     = 0;
 
-static volatile bool  baseline_ready = false;
-static float          baseline_angle_deg = 0.0f;
+// Rep detection state
+static bool  rep_in_motion    = false;
+static int   direction_changes = 0;
+static int   last_sign         = 0;
 
-static int            rep_count = 0;
-static float          total_rom_deg = 0.0f;
-static float          min_rom_deg = 0.0f;
-static float          max_rom_deg = 0.0f;
+static float rep_peak_abs_vert = 0.0f;
 
-// -------------------- REP FSM --------------------
-
-typedef enum {
-    REP_IDLE = 0,
-    REP_GOING_DOWN,
-    REP_GOING_UP
-} rep_phase_t;
-
-static rep_phase_t rep_phase = REP_IDLE;
-static float       cur_min_angle = 0.0f;
-static float       cur_max_angle = 0.0f;
+// IMU I2C address
+static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
 
 // -------------------- LVGL OBJECTS --------------------
 
-static lv_disp_t *disp;
-static lv_obj_t *label_status = NULL;
-static lv_obj_t *label_reps   = NULL;
-static lv_obj_t *label_rom    = NULL;
-static lv_obj_t *label_time   = NULL;
+static lv_disp_t *disp         = NULL;
+static lv_obj_t  *label_status = NULL;
+static lv_obj_t  *label_time   = NULL;
+static lv_obj_t  *label_reps   = NULL;
 
-// Forward declarations
-static void start_session(void);
-static void stop_session(void);
-
-// ====================================================
+// ----------------------------------------------------
 // I2C INIT
-// ====================================================
+// ----------------------------------------------------
 
 static esp_err_t i2c_master_init(void)
 {
@@ -149,76 +145,105 @@ static esp_err_t i2c_master_init(void)
     return ESP_OK;
 }
 
-// ====================================================
-// I2C helpers for ICM-20600
-// ====================================================
+static void i2c_scan(void)
+{
+    ESP_LOGI(TAG, "Starting I2C scan on port %d...", I2C_MASTER_NUM);
+    for (uint8_t addr = 1; addr < 0x7F; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd,
+                                             pdMS_TO_TICKS(10));
+        i2c_cmd_link_delete(cmd);
 
-static esp_err_t icm20600_write_reg(uint8_t reg, uint8_t data)
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  I2C device found at 0x%02X", addr);
+        }
+    }
+    ESP_LOGI(TAG, "I2C scan done");
+}
+
+// ----------------------------------------------------
+// IMU helpers
+// ----------------------------------------------------
+
+static esp_err_t imu_write_reg(uint8_t reg, uint8_t data)
 {
     uint8_t buf[2] = { reg, data };
     return i2c_master_write_to_device(I2C_MASTER_NUM,
-                                      ICM20600_ADDR,
+                                      g_imu_addr,
                                       buf, sizeof(buf),
                                       I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 }
 
-static esp_err_t icm20600_read_bytes(uint8_t reg, uint8_t *data, size_t len)
+static esp_err_t imu_read_bytes(uint8_t reg, uint8_t *data, size_t len)
 {
     return i2c_master_write_read_device(I2C_MASTER_NUM,
-                                        ICM20600_ADDR,
+                                        g_imu_addr,
                                         &reg, 1,
                                         data, len,
                                         I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 }
 
-// ====================================================
-// ICM-20600 initialization
-// ====================================================
-
-static esp_err_t icm20600_init(void)
+static esp_err_t imu_init(void)
 {
-    uint8_t who_am_i = 0;
-    esp_err_t ret = icm20600_read_bytes(REG_WHO_AM_I, &who_am_i, 1);
+    i2c_scan();
+
+    esp_err_t ret;
+    uint8_t who = 0;
+
+    g_imu_addr = 0x68;
+    ret = imu_read_bytes(REG_WHO_AM_I, &who, 1);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read WHO_AM_I: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "WHO_AM_I read failed at 0x68: %s", esp_err_to_name(ret));
         return ret;
     }
-    ESP_LOGI(TAG, "ICM-20600 WHO_AM_I = 0x%02X", who_am_i);
-    if (who_am_i != 0x11) {
-        ESP_LOGW(TAG, "Unexpected WHO_AM_I (expected 0x11) – check address/wiring");
+
+    ESP_LOGI(TAG, "WHO_AM_I = 0x%02X (addr 0x%02X)", who, g_imu_addr);
+    if (who != 0x11 && who != 0x70) {
+        ESP_LOGW(TAG, "Unexpected WHO_AM_I (expected 0x11 or 0x70)");
+    } else {
+        ESP_LOGI(TAG, "Accepted IMU WHO_AM_I");
     }
 
     // Wake up, use PLL
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_PWR_MGMT_1, 0x01));
+    ret = imu_write_reg(REG_PWR_MGMT_1, 0x01);
+    if (ret != ESP_OK) goto fail;
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Gyro ±500 dps
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_GYRO_CONFIG, 0x08));
+    ret = imu_write_reg(REG_GYRO_CONFIG, 0x08);
+    if (ret != ESP_OK) goto fail;
 
     // Accel ±4 g
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_ACCEL_CONFIG, 0x08));
+    ret = imu_write_reg(REG_ACCEL_CONFIG, 0x08);
+    if (ret != ESP_OK) goto fail;
 
     // Accel DLPF config
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_ACCEL_CONFIG2, 0x0B));
+    ret = imu_write_reg(REG_ACCEL_CONFIG2, 0x0B);
+    if (ret != ESP_OK) goto fail;
 
     // Sample rate 100 Hz: 1kHz / (1+9)
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_SMPLRT_DIV, 9));
+    ret = imu_write_reg(REG_SMPLRT_DIV, 9);
+    if (ret != ESP_OK) goto fail;
 
     // CONFIG: DLPF 3
-    ESP_ERROR_CHECK(icm20600_write_reg(REG_CONFIG, 0x03));
+    ret = imu_write_reg(REG_CONFIG, 0x03);
+    if (ret != ESP_OK) goto fail;
 
-    ESP_LOGI(TAG, "ICM-20600 initialized");
+    ESP_LOGI(TAG, "IMU initialized successfully at 0x%02X", g_imu_addr);
     return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "IMU init write failed: %s", esp_err_to_name(ret));
+    return ret;
 }
 
-// ====================================================
-// Read accelerometer (g units)
-// ====================================================
-
-static esp_err_t icm20600_read_accel(float *ax_g, float *ay_g, float *az_g)
+static esp_err_t imu_read_accel(float *ax_g, float *ay_g, float *az_g)
 {
     uint8_t raw[6];
-    esp_err_t ret = icm20600_read_bytes(REG_ACCEL_XOUT_H, raw, sizeof(raw));
+    esp_err_t ret = imu_read_bytes(REG_ACCEL_XOUT_H, raw, sizeof(raw));
     if (ret != ESP_OK) return ret;
 
     int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
@@ -232,78 +257,9 @@ static esp_err_t icm20600_read_accel(float *ax_g, float *ay_g, float *az_g)
     return ESP_OK;
 }
 
-// ====================================================
-// Angle computation
-// ====================================================
-
-static float compute_angle_deg(float ax_g, float ay_g, float az_g)
-{
-    float denom = sqrtf(ay_g * ay_g + az_g * az_g);
-    if (denom < 1e-6f) denom = 1e-6f;
-    float angle_rad = atanf(ax_g / denom);
-    return angle_rad * 180.0f / (float)M_PI;
-}
-
-// ====================================================
-// REP / ROM state management
-// ====================================================
-
-static void reset_rep_state(void)
-{
-    rep_phase = REP_IDLE;
-    cur_min_angle = 0.0f;
-    cur_max_angle = 0.0f;
-
-    rep_count = 0;
-    total_rom_deg = 0.0f;
-    min_rom_deg = 0.0f;
-    max_rom_deg = 0.0f;
-}
-
-static void rep_fsm_update(float angle_deg)
-{
-    switch (rep_phase) {
-    case REP_IDLE:
-        cur_min_angle = cur_max_angle = angle_deg;
-        if (baseline_ready &&
-            fabsf(angle_deg - baseline_angle_deg) > MOTION_START_THRESH_DEG) {
-            if (angle_deg < baseline_angle_deg) {
-                rep_phase = REP_GOING_DOWN;
-            } else {
-                rep_phase = REP_GOING_UP;
-            }
-        }
-        break;
-
-    case REP_GOING_DOWN:
-        if (angle_deg < cur_min_angle) cur_min_angle = angle_deg;
-        if (angle_deg > cur_min_angle + DIRECTION_CHANGE_THRESH_DEG) {
-            rep_phase = REP_GOING_UP;
-            cur_max_angle = angle_deg;
-        }
-        break;
-
-    case REP_GOING_UP:
-        if (angle_deg > cur_max_angle) cur_max_angle = angle_deg;
-        if (angle_deg < cur_max_angle - DIRECTION_CHANGE_THRESH_DEG) {
-            float rom = fabsf(cur_max_angle - cur_min_angle);
-            if (rom >= ROM_MIN_ANGLE_DEG) {
-                rep_count++;
-                total_rom_deg += rom;
-                if (min_rom_deg == 0.0f || rom < min_rom_deg) min_rom_deg = rom;
-                if (rom > max_rom_deg) max_rom_deg = rom;
-                ESP_LOGI(TAG, "Rep %d, ROM = %.2f deg", rep_count, rom);
-            }
-            rep_phase = REP_GOING_DOWN;
-            cur_min_angle = cur_max_angle = angle_deg;
-        }
-        break;
-    }
-}
-
-// ====================================================
-// LVGL display setup (same style as Lab 4)
-// ====================================================
+// ----------------------------------------------------
+// Display / LVGL setup (like Lab 4)
+// ----------------------------------------------------
 
 static lv_disp_t *gui_setup(void)
 {
@@ -367,24 +323,41 @@ static lv_disp_t *gui_setup(void)
     return lvgl_port_add_disp(&disp_cfg);
 }
 
-// ====================================================
+// ----------------------------------------------------
 // LVGL UI helpers
-// ====================================================
+// ----------------------------------------------------
+
+static void update_labels_idle(const char *reason)
+{
+    if (!label_status || !label_time || !label_reps) return;
+
+    char buf[160];
+    lvgl_port_lock(0);
+
+    snprintf(buf, sizeof(buf),
+             "RepSense: %s\nPress button to START", reason ? reason : "IDLE");
+    lv_label_set_text(label_status, buf);
+
+    lv_label_set_text(label_time, "Time: 0.0 s");
+    lv_label_set_text(label_reps, "Reps: 0");
+
+    lvgl_port_unlock();
+}
 
 static void update_labels_running(void)
 {
-    if (!label_status || !label_reps || !label_rom || !label_time) return;
+    if (!label_status || !label_time || !label_reps) return;
 
     int64_t now_us = esp_timer_get_time();
-    int64_t dt_us = now_us - session_start_us;
+    int64_t dt_us  = now_us - session_start_us;
     if (dt_us < 0) dt_us = 0;
     float seconds = (float)dt_us / 1e6f;
 
-    char buf[128];
-
+    char buf[160];
     lvgl_port_lock(0);
 
-    snprintf(buf, sizeof(buf), "RepSense: RUNNING\n(press button to STOP)");
+    snprintf(buf, sizeof(buf),
+             "RepSense: RUNNING\n(press button to STOP)");
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", seconds);
@@ -393,47 +366,18 @@ static void update_labels_running(void)
     snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
     lv_label_set_text(label_reps, buf);
 
-    if (rep_count > 0) {
-        float avg_rom = total_rom_deg / (float)rep_count;
-        snprintf(buf, sizeof(buf),
-                 "ROM avg: %.1f deg\nmin: %.1f max: %.1f",
-                 avg_rom, min_rom_deg, max_rom_deg);
-    } else {
-        snprintf(buf, sizeof(buf),
-                 "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
-    }
-    lv_label_set_text(label_rom, buf);
-
-    lvgl_port_unlock();
-}
-
-static void update_labels_idle(const char *reason)
-{
-    if (!label_status || !label_reps || !label_rom || !label_time) return;
-
-    char buf[128];
-
-    lvgl_port_lock(0);
-
-    snprintf(buf, sizeof(buf), "RepSense: %s\nPress button to START", reason ? reason : "IDLE");
-    lv_label_set_text(label_status, buf);
-
-    lv_label_set_text(label_time, "Time: 0.0 s");
-    lv_label_set_text(label_reps, "Reps: 0");
-    lv_label_set_text(label_rom, "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
-
     lvgl_port_unlock();
 }
 
 static void update_labels_done(float total_time_s)
 {
-    if (!label_status || !label_reps || !label_rom || !label_time) return;
+    if (!label_status || !label_time || !label_reps) return;
 
-    char buf[128];
-
+    char buf[160];
     lvgl_port_lock(0);
 
-    snprintf(buf, sizeof(buf), "RepSense: DONE\nPress button to START again");
+    snprintf(buf, sizeof(buf),
+             "RepSense: DONE\nPress button to START again");
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
@@ -441,17 +385,6 @@ static void update_labels_done(float total_time_s)
 
     snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
     lv_label_set_text(label_reps, buf);
-
-    if (rep_count > 0) {
-        float avg_rom = total_rom_deg / (float)rep_count;
-        snprintf(buf, sizeof(buf),
-                 "ROM avg: %.1f deg\nmin: %.1f max: %.1f",
-                 avg_rom, min_rom_deg, max_rom_deg);
-    } else {
-        snprintf(buf, sizeof(buf),
-                 "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
-    }
-    lv_label_set_text(label_rom, buf);
 
     lvgl_port_unlock();
 }
@@ -466,22 +399,25 @@ static void create_main_screen(void)
     lv_obj_set_width(label_status, 220);
 
     label_time = lv_label_create(scr);
-    lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 70);
 
     label_reps = lv_label_create(scr);
-    lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 90);
-
-    label_rom = lv_label_create(scr);
-    lv_label_set_long_mode(label_rom, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(label_rom, 220);
-    lv_obj_align(label_rom, LV_ALIGN_TOP_MID, 0, 120);
+    lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 110);
 
     update_labels_idle("READY");
 }
 
-// ====================================================
+// ----------------------------------------------------
 // Session control
-// ====================================================
+// ----------------------------------------------------
+
+static void reset_rep_state(void)
+{
+    rep_count        = 0;
+    rep_in_motion    = false;
+    direction_changes = 0;
+    last_sign         = 0;
+}
 
 static void start_session(void)
 {
@@ -489,13 +425,14 @@ static void start_session(void)
 
     ESP_LOGI(TAG, "Session START");
 
-    sample_count = 0;
-    baseline_ready = false;
-    baseline_angle_deg = 0.0f;
+    baseline_ready   = false;
+    baseline_acc_g   = 0.0f;
+    g_unit_x = g_unit_y = g_unit_z = 0.0f;
+
     reset_rep_state();
 
     session_start_us = esp_timer_get_time();
-    session_running = true;
+    session_running  = true;
 
     update_labels_idle("CALIBRATING...");
 }
@@ -507,7 +444,7 @@ static void stop_session(void)
     session_running = false;
 
     int64_t now_us = esp_timer_get_time();
-    int64_t dt_us = now_us - session_start_us;
+    int64_t dt_us  = now_us - session_start_us;
     if (dt_us < 0) dt_us = 0;
     float seconds = (float)dt_us / 1e6f;
 
@@ -516,9 +453,75 @@ static void stop_session(void)
     update_labels_done(seconds);
 }
 
-// ====================================================
+// ----------------------------------------------------
+// Rep detection using vertical acceleration (bench press)
+// ----------------------------------------------------
+
+static void rep_update_from_vertical(float a_vert)
+{
+    if (!baseline_ready || !session_running) return;
+
+    float abs_vert = fabsf(a_vert);
+
+    // Determine sign with deadzone
+    int sign;
+    if (a_vert > VERT_SIGN_DEADZONE_G) {
+        sign = 1;
+    } else if (a_vert < -VERT_SIGN_DEADZONE_G) {
+        sign = -1;
+    } else {
+        sign = 0;
+    }
+
+    if (!rep_in_motion) {
+        // Start of motion: |a_vert| big enough
+        if (abs_vert >= VERT_MOTION_THRESH_G) {
+            rep_in_motion      = true;
+            direction_changes  = 0;
+            last_sign          = sign;
+            rep_peak_abs_vert  = abs_vert;   // start tracking peak
+            ESP_LOGI(TAG, "Rep motion started (a_vert=%.3f g)", a_vert);
+        }
+    } else {
+        // While in motion, update peak vertical accel
+        if (abs_vert > rep_peak_abs_vert) {
+            rep_peak_abs_vert = abs_vert;
+        }
+
+        // Direction change: sign flip of vertical accel
+        if (sign != 0 && last_sign != 0 && sign != last_sign) {
+            direction_changes++;
+            ESP_LOGI(TAG, "Direction change %d (sign %d -> %d, a_vert=%.3f)",
+                     direction_changes, last_sign, sign, a_vert);
+            last_sign = sign;
+        }
+
+        // If we've seen at least 2 direction changes and come back near baseline,
+        // we treat that as a *candidate* rep.
+        if (direction_changes >= 2 && abs_vert <= VERT_RETURN_THRESH_G) {
+            if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
+                // Valid rep: sufficiently strong
+                rep_count++;
+                ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
+            } else {
+                // Too weak: likely noise
+                ESP_LOGI(TAG,
+                         "Motion ended but peak |a_vert|=%.3f g < %.3f g (not counting)",
+                         rep_peak_abs_vert, VERT_PEAK_MIN_G);
+            }
+
+            // Reset motion state
+            rep_in_motion      = false;
+            direction_changes  = 0;
+            last_sign          = 0;
+            rep_peak_abs_vert  = 0.0f;
+        }
+    }
+}
+
+// ----------------------------------------------------
 // IMU sampling task
-// ====================================================
+// ----------------------------------------------------
 
 static void imu_task(void *arg)
 {
@@ -526,10 +529,14 @@ static void imu_task(void *arg)
 
     ESP_LOGI(TAG, "IMU task started");
 
-    int calib_count = 0;
-    float calib_sum = 0.0f;
-    bool prev_running = false;
-    int ui_counter = 0;
+    int   calib_count   = 0;
+    float calib_sum_ax  = 0.0f;
+    float calib_sum_ay  = 0.0f;
+    float calib_sum_az  = 0.0f;
+
+    bool  prev_running  = false;
+    int   ui_counter    = 0;
+    int   dbg_counter   = 0;
 
     while (1) {
         if (!session_running) {
@@ -539,49 +546,69 @@ static void imu_task(void *arg)
         }
 
         if (!prev_running) {
-            calib_count = 0;
-            calib_sum = 0.0f;
-            baseline_ready = false;
-            prev_running = true;
+            calib_count   = 0;
+            calib_sum_ax  = 0.0f;
+            calib_sum_ay  = 0.0f;
+            calib_sum_az  = 0.0f;
+
+            baseline_ready   = false;
+            reset_rep_state();
+
+            prev_running  = true;
             ESP_LOGI(TAG, "Calibration phase started");
         }
 
         float ax_g, ay_g, az_g;
-        esp_err_t ret = icm20600_read_accel(&ax_g, &ay_g, &az_g);
+        esp_err_t ret = imu_read_accel(&ax_g, &ay_g, &az_g);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to read accel: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
             continue;
         }
 
-        float angle_deg = compute_angle_deg(ax_g, ay_g, az_g);
-
         if (!baseline_ready) {
-            calib_sum += angle_deg;
+            // Collect samples for baseline
+            calib_sum_ax += ax_g;
+            calib_sum_ay += ay_g;
+            calib_sum_az += az_g;
             calib_count++;
+
             if (calib_count >= CALIB_SAMPLES) {
-                baseline_angle_deg = calib_sum / (float)calib_count;
+                float avg_ax = calib_sum_ax / (float)calib_count;
+                float avg_ay = calib_sum_ay / (float)calib_count;
+                float avg_az = calib_sum_az / (float)calib_count;
+
+                baseline_acc_g = sqrtf(avg_ax*avg_ax + avg_ay*avg_ay + avg_az*avg_az);
+                if (baseline_acc_g < 1e-6f) baseline_acc_g = 1e-6f;
+
+                // gravity unit vector (down direction)
+                g_unit_x = avg_ax / baseline_acc_g;
+                g_unit_y = avg_ay / baseline_acc_g;
+                g_unit_z = avg_az / baseline_acc_g;
+
                 baseline_ready = true;
-                ESP_LOGI(TAG, "Baseline angle = %.2f deg", baseline_angle_deg);
+                ESP_LOGI(TAG,
+                         "Baseline |acc| = %.3f g, g_unit=(%.3f, %.3f, %.3f)",
+                         baseline_acc_g, g_unit_x, g_unit_y, g_unit_z);
+            }
+        } else {
+            // Vertical acceleration along gravity
+            float proj   = ax_g * g_unit_x + ay_g * g_unit_y + az_g * g_unit_z;
+            float a_vert = proj - baseline_acc_g;   // dynamic vertical accel
+
+            rep_update_from_vertical(a_vert);
+
+            // Debug every ~10 samples
+            dbg_counter++;
+            if (dbg_counter >= 10) {
+                dbg_counter = 0;
+                ESP_LOGI(TAG,
+                         "a_vert=%.3f g, reps=%d, running=%d",
+                         a_vert, rep_count, session_running ? 1 : 0);
             }
         }
 
-        if (sample_count < MAX_SAMPLES) {
-            int64_t now_us = esp_timer_get_time();
-            uint32_t t_ms = (uint32_t)((now_us - session_start_us) / 1000);
-            samples[sample_count].t_ms = t_ms;
-            samples[sample_count].angle_deg = angle_deg;
-            samples[sample_count].ax_g = ax_g;
-            samples[sample_count].ay_g = ay_g;
-            samples[sample_count].az_g = az_g;
-            sample_count++;
-        }
-
-        if (baseline_ready) {
-            rep_fsm_update(angle_deg);
-        }
-
-        // Update UI roughly every 100 ms (10 samples)
+        // Update UI every ~10 samples
         ui_counter++;
         if (ui_counter >= 10) {
             ui_counter = 0;
@@ -592,9 +619,9 @@ static void imu_task(void *arg)
     }
 }
 
-// ====================================================
+// ----------------------------------------------------
 // Button task (polling + debounce)
-// ====================================================
+// ----------------------------------------------------
 
 static void button_init(void)
 {
@@ -635,49 +662,38 @@ static void button_task(void *arg)
     }
 }
 
-// ====================================================
+// ----------------------------------------------------
 // app_main
-// ====================================================
+// ----------------------------------------------------
 
 void app_main(void)
 {
-    // 1) NVS init (same as labs)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // 2) Display + LVGL (exactly like Lab 4)
+    // Display + LVGL
     disp = gui_setup();
 
-    // Create our labels
     lvgl_port_lock(0);
     create_main_screen();
     lvgl_port_unlock();
 
-    // Show "init" status
     update_labels_idle("INIT I2C/IMU...");
 
-    // 3) I2C init (NON-fatal)
-    ret = i2c_master_init();
+    // I2C
+    esp_err_t ret = i2c_master_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
         update_labels_idle("I2C ERROR");
-        // We can stop here; display stays on with error message
         return;
     }
 
-    // 4) IMU init (NON-fatal)
-    ret = icm20600_init();
+    // IMU
+    ret = imu_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "IMU init failed: %s", esp_err_to_name(ret));
         update_labels_idle("IMU ERROR");
         return;
     }
 
-    // 5) Button + tasks
+    // Button + tasks
     button_init();
 
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
