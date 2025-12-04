@@ -1,6 +1,6 @@
-// main.c – RepSense v0.2 (HW button version)
-// ESP32-S3-BOX-3 + Grove IMU 9DoF (ICM-20600)
-// Physical button toggles START / STOP. Touchscreen not used.
+// main.c – RepSense (ESP32-S3-BOX-3 + Grove IMU 9DoF)
+// Display init matches Lab 4 style (esp32s3_box_lcd_config.h).
+// START/STOP via physical button (no touch).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,43 +15,49 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
-#include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "driver/i2c.h"
 
-// ---- BSP / LVGL (from your lab 4) ----
-#include "bsp/esp-bsp.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lvgl_port.h"
+
 #include "lvgl.h"
+#include "esp32s3_box_lcd_config.h"
 
 static const char *TAG = "RepSense";
 
-// ---------- I2C / IMU DEFINES ----------
+// -------------------- I2C / IMU DEFINES --------------------
 
-#define I2C_MASTER_NUM          I2C_NUM_0
-#define I2C_MASTER_TIMEOUT_MS   100
+#define I2C_MASTER_SCL_IO          40          // wired SCL on BREAD
+#define I2C_MASTER_SDA_IO          41          // wired SDA on BREAD
+#define I2C_MASTER_NUM             I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ         400000
+#define I2C_MASTER_TIMEOUT_MS      100
 
-// Grove IMU 9DoF default address (AD0=1 -> 0x69). Change to 0x68 if needed.
-#define ICM20600_ADDR           0x69
+// Grove IMU 9DoF (ICM-20600) I2C address (AD0=1 -> 0x69, AD0=0 -> 0x68)
+#define ICM20600_ADDR              0x69
 
-// ICM-20600 register map (from datasheet)
-#define REG_SMPLRT_DIV          0x19
-#define REG_CONFIG              0x1A
-#define REG_GYRO_CONFIG         0x1B
-#define REG_ACCEL_CONFIG        0x1C
-#define REG_ACCEL_CONFIG2       0x1D
-#define REG_PWR_MGMT_1          0x6B
-#define REG_WHO_AM_I            0x75
-#define REG_ACCEL_XOUT_H        0x3B
+// ICM-20600 registers (from datasheet)
+#define REG_SMPLRT_DIV             0x19
+#define REG_CONFIG                 0x1A
+#define REG_GYRO_CONFIG            0x1B
+#define REG_ACCEL_CONFIG           0x1C
+#define REG_ACCEL_CONFIG2          0x1D
+#define REG_PWR_MGMT_1             0x6B
+#define REG_WHO_AM_I               0x75
+#define REG_ACCEL_XOUT_H           0x3B
 
-// accel scale: ACCEL_CONFIG = 0x08 -> ±4g -> 8192 LSB/g
-#define ACCEL_LSB_PER_G_4G      8192.0f
+// Accel scale: ±4 g -> 8192 LSB/g
+#define ACCEL_LSB_PER_G_4G         8192.0f
 
-// ---------- BUTTON GPIO (physical button) ----------
+// -------------------- BUTTON GPIO --------------------
 
-// CHANGE THIS to the GPIO your button is connected to.
-// Very commonly the BOOT button is GPIO0, but confirm with your board.
-#define BUTTON_GPIO             10
+// Change this if your physical button is on another pin.
+#define BUTTON_GPIO                0
 
-// ---------- REP / ROM PARAMETERS ----------
+// -------------------- REP / SAMPLING PARAMS --------------------
 
 #define SAMPLE_RATE_HZ                 100
 #define SAMPLE_PERIOD_MS               (1000 / SAMPLE_RATE_HZ)
@@ -64,7 +70,7 @@ static const char *TAG = "RepSense";
 #define MAX_SESSION_SECONDS            60
 #define MAX_SAMPLES   (SAMPLE_RATE_HZ * MAX_SESSION_SECONDS)
 
-// ---------- GLOBAL SESSION STATE ----------
+// -------------------- GLOBAL SESSION STATE --------------------
 
 typedef struct {
     uint32_t t_ms;
@@ -76,7 +82,6 @@ static sample_t samples[MAX_SAMPLES];
 static size_t   sample_count = 0;
 
 static volatile bool     session_running = false;
-static volatile bool     session_just_started = false;
 static volatile int64_t  session_start_us = 0;
 
 static volatile bool  baseline_ready = false;
@@ -87,7 +92,7 @@ static float          total_rom_deg = 0.0f;
 static float          min_rom_deg = 0.0f;
 static float          max_rom_deg = 0.0f;
 
-// ---------- REP FSM ----------
+// -------------------- REP FSM --------------------
 
 typedef enum {
     REP_IDLE = 0,
@@ -99,20 +104,54 @@ static rep_phase_t rep_phase = REP_IDLE;
 static float       cur_min_angle = 0.0f;
 static float       cur_max_angle = 0.0f;
 
-// ---------- LVGL UI OBJECTS ----------
+// -------------------- LVGL OBJECTS --------------------
 
+static lv_disp_t *disp;
 static lv_obj_t *label_status = NULL;
 static lv_obj_t *label_reps   = NULL;
 static lv_obj_t *label_rom    = NULL;
 static lv_obj_t *label_time   = NULL;
 
-// forward declarations
+// Forward declarations
 static void start_session(void);
 static void stop_session(void);
 
-// =========================================
-// I2C helper functions
-// =========================================
+// ====================================================
+// I2C INIT
+// ====================================================
+
+static esp_err_t i2c_master_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .clk_flags = 0,
+    };
+
+    esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_param_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_driver_install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "I2C master initialized (SDA=%d, SCL=%d)",
+             I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+    return ESP_OK;
+}
+
+// ====================================================
+// I2C helpers for ICM-20600
+// ====================================================
 
 static esp_err_t icm20600_write_reg(uint8_t reg, uint8_t data)
 {
@@ -132,23 +171,21 @@ static esp_err_t icm20600_read_bytes(uint8_t reg, uint8_t *data, size_t len)
                                         I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 }
 
-// =========================================
+// ====================================================
 // ICM-20600 initialization
-// =========================================
+// ====================================================
 
 static esp_err_t icm20600_init(void)
 {
-    esp_err_t ret;
     uint8_t who_am_i = 0;
-
-    ret = icm20600_read_bytes(REG_WHO_AM_I, &who_am_i, 1);
+    esp_err_t ret = icm20600_read_bytes(REG_WHO_AM_I, &who_am_i, 1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read WHO_AM_I: %s", esp_err_to_name(ret));
         return ret;
     }
     ESP_LOGI(TAG, "ICM-20600 WHO_AM_I = 0x%02X", who_am_i);
     if (who_am_i != 0x11) {
-        ESP_LOGW(TAG, "Unexpected WHO_AM_I (expected 0x11), check wiring / address");
+        ESP_LOGW(TAG, "Unexpected WHO_AM_I (expected 0x11) – check address/wiring");
     }
 
     // Wake up, use PLL
@@ -174,17 +211,15 @@ static esp_err_t icm20600_init(void)
     return ESP_OK;
 }
 
-// =========================================
-// Read accelerometer data (g units)
-// =========================================
+// ====================================================
+// Read accelerometer (g units)
+// ====================================================
 
 static esp_err_t icm20600_read_accel(float *ax_g, float *ay_g, float *az_g)
 {
     uint8_t raw[6];
     esp_err_t ret = icm20600_read_bytes(REG_ACCEL_XOUT_H, raw, sizeof(raw));
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    if (ret != ESP_OK) return ret;
 
     int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
     int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
@@ -197,9 +232,9 @@ static esp_err_t icm20600_read_accel(float *ax_g, float *ay_g, float *az_g)
     return ESP_OK;
 }
 
-// =========================================
+// ====================================================
 // Angle computation
-// =========================================
+// ====================================================
 
 static float compute_angle_deg(float ax_g, float ay_g, float az_g)
 {
@@ -209,9 +244,9 @@ static float compute_angle_deg(float ax_g, float ay_g, float az_g)
     return angle_rad * 180.0f / (float)M_PI;
 }
 
-// =========================================
+// ====================================================
 // REP / ROM state management
-// =========================================
+// ====================================================
 
 static void reset_rep_state(void)
 {
@@ -266,9 +301,75 @@ static void rep_fsm_update(float angle_deg)
     }
 }
 
-// =========================================
+// ====================================================
+// LVGL display setup (same style as Lab 4)
+// ====================================================
+
+static lv_disp_t *gui_setup(void)
+{
+    gpio_config_t bk_gpio_config = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = 1ULL << EXAMPLE_PIN_NUM_BK_LIGHT
+    };
+    ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
+
+    spi_bus_config_t bus_config = {
+        .sclk_io_num = EXAMPLE_PIN_NUM_SCLK,
+        .mosi_io_num = EXAMPLE_PIN_NUM_MOSI,
+        .miso_io_num = EXAMPLE_PIN_NUM_MISO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = EXAMPLE_LCD_H_RES * 80 * sizeof(uint16_t),
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = EXAMPLE_PIN_NUM_LCD_DC,
+        .cs_gpio_num = EXAMPLE_PIN_NUM_LCD_CS,
+        .pclk_hz = EXAMPLE_LCD_PIXEL_CLOCK_HZ,
+        .lcd_cmd_bits = EXAMPLE_LCD_CMD_BITS,
+        .lcd_param_bits = EXAMPLE_LCD_PARAM_BITS,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+                                             &io_config, &io_handle));
+
+    esp_lcd_panel_handle_t panel_handle = NULL;
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST,
+        .flags.reset_active_high = 1,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    gpio_set_level(EXAMPLE_PIN_NUM_BK_LIGHT, EXAMPLE_LCD_BK_LIGHT_ON_LEVEL);
+
+    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_port_init(&lvgl_cfg);
+
+    const lvgl_port_display_cfg_t disp_cfg = {
+        .io_handle = io_handle,
+        .panel_handle = panel_handle,
+        .buffer_size = EXAMPLE_LCD_H_RES * EXAMPLE_LVGL_DRAW_BUF_LINES,
+        .double_buffer = true,
+        .hres = EXAMPLE_LCD_H_RES,
+        .vres = EXAMPLE_LCD_V_RES,
+        .monochrome = false,
+        .flags = {.swap_bytes = true},
+        .rotation = {.swap_xy = false, .mirror_x = true, .mirror_y = true}
+    };
+    return lvgl_port_add_disp(&disp_cfg);
+}
+
+// ====================================================
 // LVGL UI helpers
-// =========================================
+// ====================================================
 
 static void update_labels_running(void)
 {
@@ -279,9 +380,11 @@ static void update_labels_running(void)
     if (dt_us < 0) dt_us = 0;
     float seconds = (float)dt_us / 1e6f;
 
-    char buf[96];
+    char buf[128];
 
-    snprintf(buf, sizeof(buf), "RepSense: RUNNING (press button to STOP)");
+    lvgl_port_lock(0);
+
+    snprintf(buf, sizeof(buf), "RepSense: RUNNING\n(press button to STOP)");
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", seconds);
@@ -300,32 +403,59 @@ static void update_labels_running(void)
                  "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
     }
     lv_label_set_text(label_rom, buf);
+
+    lvgl_port_unlock();
 }
 
 static void update_labels_idle(const char *reason)
 {
     if (!label_status || !label_reps || !label_rom || !label_time) return;
 
-    char buf[96];
+    char buf[128];
+
+    lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf), "RepSense: %s\nPress button to START", reason ? reason : "IDLE");
     lv_label_set_text(label_status, buf);
 
     lv_label_set_text(label_time, "Time: 0.0 s");
     lv_label_set_text(label_reps, "Reps: 0");
-    lv_label_set_text(label_rom,
-                      "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
+    lv_label_set_text(label_rom, "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
+
+    lvgl_port_unlock();
 }
 
-static void ui_timer_cb(lv_timer_t *timer)
+static void update_labels_done(float total_time_s)
 {
-    (void) timer;
-    if (session_running) {
-        update_labels_running();
+    if (!label_status || !label_reps || !label_rom || !label_time) return;
+
+    char buf[128];
+
+    lvgl_port_lock(0);
+
+    snprintf(buf, sizeof(buf), "RepSense: DONE\nPress button to START again");
+    lv_label_set_text(label_status, buf);
+
+    snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
+    lv_label_set_text(label_time, buf);
+
+    snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
+    lv_label_set_text(label_reps, buf);
+
+    if (rep_count > 0) {
+        float avg_rom = total_rom_deg / (float)rep_count;
+        snprintf(buf, sizeof(buf),
+                 "ROM avg: %.1f deg\nmin: %.1f max: %.1f",
+                 avg_rom, min_rom_deg, max_rom_deg);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
     }
+    lv_label_set_text(label_rom, buf);
+
+    lvgl_port_unlock();
 }
 
-// Simple screen with labels only
 static void create_main_screen(void)
 {
     lv_obj_t *scr = lv_scr_act();
@@ -336,24 +466,22 @@ static void create_main_screen(void)
     lv_obj_set_width(label_status, 220);
 
     label_time = lv_label_create(scr);
-    lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 60);
 
     label_reps = lv_label_create(scr);
-    lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 90);
 
     label_rom = lv_label_create(scr);
     lv_label_set_long_mode(label_rom, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(label_rom, 220);
-    lv_obj_align(label_rom, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_align(label_rom, LV_ALIGN_TOP_MID, 0, 120);
 
     update_labels_idle("READY");
-
-    lv_timer_create(ui_timer_cb, 200, NULL);
 }
 
-// =========================================
+// ====================================================
 // Session control
-// =========================================
+// ====================================================
 
 static void start_session(void)
 {
@@ -368,7 +496,6 @@ static void start_session(void)
 
     session_start_us = esp_timer_get_time();
     session_running = true;
-    session_just_started = true;
 
     update_labels_idle("CALIBRATING...");
 }
@@ -386,44 +513,23 @@ static void stop_session(void)
 
     ESP_LOGI(TAG, "Session STOP: time = %.2f s, reps = %d", seconds, rep_count);
 
-    if (label_status && label_reps && label_rom && label_time) {
-        char buf[96];
-
-        snprintf(buf, sizeof(buf), "RepSense: DONE\nPress button to START again");
-        lv_label_set_text(label_status, buf);
-
-        snprintf(buf, sizeof(buf), "Time: %.1f s", seconds);
-        lv_label_set_text(label_time, buf);
-
-        snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
-        lv_label_set_text(label_reps, buf);
-
-        if (rep_count > 0) {
-            float avg_rom = total_rom_deg / (float)rep_count;
-            snprintf(buf, sizeof(buf),
-                     "ROM avg: %.1f deg\nmin: %.1f max: %.1f",
-                     avg_rom, min_rom_deg, max_rom_deg);
-        } else {
-            snprintf(buf, sizeof(buf),
-                     "ROM avg: 0.0 deg\nmin: 0.0 max: 0.0");
-        }
-        lv_label_set_text(label_rom, buf);
-    }
+    update_labels_done(seconds);
 }
 
-// =========================================
+// ====================================================
 // IMU sampling task
-// =========================================
+// ====================================================
 
 static void imu_task(void *arg)
 {
-    (void) arg;
+    (void)arg;
 
     ESP_LOGI(TAG, "IMU task started");
 
     int calib_count = 0;
     float calib_sum = 0.0f;
     bool prev_running = false;
+    int ui_counter = 0;
 
     while (1) {
         if (!session_running) {
@@ -475,13 +581,20 @@ static void imu_task(void *arg)
             rep_fsm_update(angle_deg);
         }
 
+        // Update UI roughly every 100 ms (10 samples)
+        ui_counter++;
+        if (ui_counter >= 10) {
+            ui_counter = 0;
+            update_labels_running();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
 
-// =========================================
-// Button task (polling with debounce)
-// =========================================
+// ====================================================
+// Button task (polling + debounce)
+// ====================================================
 
 static void button_init(void)
 {
@@ -497,7 +610,7 @@ static void button_init(void)
 
 static void button_task(void *arg)
 {
-    (void) arg;
+    (void)arg;
     ESP_LOGI(TAG, "Button task started on GPIO %d", BUTTON_GPIO);
 
     int last_level = gpio_get_level(BUTTON_GPIO);
@@ -505,12 +618,10 @@ static void button_task(void *arg)
     while (1) {
         int level = gpio_get_level(BUTTON_GPIO);
 
-        // detect falling edge (HIGH -> LOW)
+        // Detect falling edge (HIGH -> LOW)
         if (last_level == 1 && level == 0) {
-            // debounce
-            vTaskDelay(pdMS_TO_TICKS(30));
+            vTaskDelay(pdMS_TO_TICKS(30)); // debounce
             if (gpio_get_level(BUTTON_GPIO) == 0) {
-                // toggle session
                 if (!session_running) {
                     start_session();
                 } else {
@@ -524,37 +635,32 @@ static void button_task(void *arg)
     }
 }
 
-// =========================================
+// ====================================================
 // app_main
-// =========================================
+// ====================================================
 
 void app_main(void)
 {
-    esp_err_t ret;
-
-    ret = nvs_flash_init();
+    esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_ERROR_CHECK(bsp_i2c_init());
-
-    lv_disp_t *disp = bsp_display_start();
-    (void) disp;
-    bsp_display_brightness_set(80);
-
-    bsp_display_lock(0);
-    create_main_screen();
-    bsp_display_unlock();
-
+    ESP_ERROR_CHECK(i2c_master_init());
     ESP_ERROR_CHECK(icm20600_init());
+
+    disp = gui_setup();
+
+    lvgl_port_lock(0);
+    create_main_screen();
+    lvgl_port_unlock();
 
     button_init();
 
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
     xTaskCreate(button_task, "button_task", 2048, NULL, 6, NULL);
 
-    ESP_LOGI(TAG, "RepSense setup complete – press the button to START/STOP");
+    ESP_LOGI(TAG, "RepSense ready – press the button to START/STOP");
 }
