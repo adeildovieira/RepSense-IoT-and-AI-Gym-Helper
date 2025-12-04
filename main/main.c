@@ -14,6 +14,13 @@
 
 #include <stdint.h>
 
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "freertos/event_groups.h"
+#include "esp_http_client.h"
+#include "esp_tls.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +38,9 @@
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 
+#include "esp_http_client.h"
+#include "esp_tls.h"
+
 #include "esp32s3_box_lcd_config.h"
 
 #ifndef M_PI
@@ -38,6 +48,38 @@
 #endif
 
 static const char *TAG = "RepSense";
+
+// -------------------- OpenAI API key (demo) --------------------
+// NOTE: For a real project, do NOT commit the real key to Git.
+// This is fine for local testing / class demos.
+
+#define OPENAI_API_KEY "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"
+
+// Model name for chat completions
+static const char *OPENAI_MODEL_NAME = "gpt-5-mini";
+
+//
+// -------------------- OpenAI ChatGPT config --------------------
+
+static const char *OPENAI_SYSTEM_PROMPT =
+    "You are RepSense, an AI gym coach.\n"
+    "The user will send you workout sets in a custom text format "
+    "called 'RepSenseToon v1'. Each Toon includes:\n"
+    "- session_id: integer ID of the set\n"
+    "- time_s: duration of the set in seconds\n"
+    "- reps: total bench press reps counted\n"
+    "- imbalance_deg: absolute angle drift in degrees between start and end.\n"
+    "\n"
+    "DO NOT HALLUCINATE or make up any data; only use what is provided.\n"
+    "DO NOT ASK QUESTIONS; only provide feedback based on the data.\n"
+    "Your job is to:\n"
+    "1) Briefly assess the set (effort, volume, and bar symmetry).\n"
+    "2) Briefly comment on whether the imbalance_deg is concerning or fine.\n"
+    "3) Give 1–2 concrete tips for the next set.\n"
+    "Respond in **at most 3 short bullet points**, friendly and encouraging, "
+    "no emojis.";
+
+//
 
 // -------------------- I2C / IMU DEFINES --------------------
 
@@ -82,6 +124,183 @@ static const char *TAG = "RepSense";
 #define VERT_PEAK_MIN_G            0.075f   // require >= 0.075 g at some point in the rep
 
 // If you really want a ROM threshold, we’d need angle; here we focus on reps only.
+
+// -------------------- Wi-Fi (DukeOpen) --------------------
+
+#define WIFI_SSID "DukeOpen"
+#define WIFI_PASS ""      // open network
+
+static EventGroupHandle_t s_wifi_event_group;
+static const int WIFI_CONNECTED_BIT = BIT0;
+static const int WIFI_FAIL_BIT      = BIT1;
+
+static bool g_wifi_ready = false;
+static bool g_wifi_inited = false;
+
+static const int WIFI_MAX_RETRY = 5;
+static int s_retry_num = 0;
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI("WiFi", "retrying to connect to AP...");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+    } else if (event_base == IP_EVENT &&
+               event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI("WiFi", "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t wifi_connect_dukeopen(void)
+{
+    if (g_wifi_ready) {
+        // Already connected or considered ready
+        return ESP_OK;
+    }
+
+    if (!g_wifi_inited) {
+        s_wifi_event_group = xEventGroupCreate();
+
+        esp_err_t err;
+
+        err = esp_netif_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+
+        esp_netif_create_default_wifi_sta();
+
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
+                                                   ESP_EVENT_ANY_ID,
+                                                   &wifi_event_handler,
+                                                   NULL));
+        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
+                                                   IP_EVENT_STA_GOT_IP,
+                                                   &wifi_event_handler,
+                                                   NULL));
+
+        wifi_config_t wifi_config = {0};
+        strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID,
+                sizeof(wifi_config.sta.ssid));
+        strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
+                sizeof(wifi_config.sta.password));
+
+        // Open network
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        g_wifi_inited = true;
+    }
+
+    ESP_LOGI("WiFi", "Connecting to SSID:%s", WIFI_SSID);
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE,      // do not clear bits on exit
+        pdFALSE,      // wait for either bit
+        pdMS_TO_TICKS(15000)  // 15s timeout
+    );
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI("WiFi", "connected to ap SSID:%s", WIFI_SSID);
+        g_wifi_ready = true;
+        return ESP_OK;
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGW("WiFi", "failed to connect to SSID:%s", WIFI_SSID);
+        return ESP_FAIL;
+    } else {
+        ESP_LOGW("WiFi", "Wi-Fi connect timeout");
+        return ESP_FAIL;
+    }
+}
+
+// -------------------- OpenAI HTTPS request --------------------
+
+static esp_err_t openai_send_chat_request(const char *json_body)
+{
+    if (!json_body) return ESP_ERR_INVALID_ARG;
+
+    if (!g_wifi_ready) {
+        ESP_LOGW("OpenAI", "Wi-Fi not ready, skipping OpenAI request");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI("OpenAI", "Sending Chat Completions request...");
+
+    esp_http_client_config_t cfg = {
+        .url = "https://api.openai.com/v1/chat/completions",
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 15000,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE("OpenAI", "Failed to init HTTP client");
+        return ESP_FAIL;
+    }
+
+    // Authorization header: "Bearer sk-..."
+    char auth_header[160];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
+
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    esp_http_client_set_post_field(client, json_body, strlen(json_body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        int len    = esp_http_client_get_content_length(client);
+        ESP_LOGI("OpenAI", "HTTP status = %d, content length = %d",
+                 status, len);
+
+        // Read and log up to 500 bytes of the response
+        char resp_buf[512];
+        int  read_len = esp_http_client_read(client,
+                                             resp_buf,
+                                             sizeof(resp_buf) - 1);
+        if (read_len > 0) {
+            resp_buf[read_len] = '\0';
+            ESP_LOGI("OpenAI", "Response (truncated): %s", resp_buf);
+        } else {
+            ESP_LOGW("OpenAI", "No response body or read error");
+        }
+    } else {
+        ESP_LOGE("OpenAI", "Request failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
 
 // -------------------- GLOBAL SESSION STATE --------------------
 
@@ -463,6 +682,182 @@ static void build_session_toon(const repsense_session_t *s,
 }
 
 // ----------------------------------------------------
+// Build JSON body for OpenAI Chat Completions API
+// ----------------------------------------------------
+//
+// We still use TOON as the *user content*, but the API itself
+// always expects JSON as transport.
+//
+// NOTE: This just builds the JSON string. Sending it over HTTPS
+// will be done later via esp_http_client.
+//
+
+static void build_openai_chat_body(const char *toon,
+                                   char *out,
+                                   size_t out_size)
+{
+    if (!toon || !out || out_size == 0) {
+        return;
+    }
+
+    // For simplicity, we rely on the fact that the Toon format
+    // does not contain double quotes. Newlines are embedded literally.
+    // If you ever add quotes to Toon, we should escape them.
+
+    // Model name can be adjusted later (e.g., "gpt-4.1-mini").
+    const char *model = "gpt-4.1-mini";
+
+    // Basic JSON body:
+    // {
+    //   "model": "...",
+    //   "messages": [
+    //     {"role": "system", "content": "..."},
+    //     {"role": "user",   "content": "RepSenseToon v1\n..."}
+    //   ]
+    // }
+
+    // We use snprintf to keep within out_size.
+    // Toon is inserted as-is inside the user content string.
+    snprintf(out, out_size,
+             "{"
+             "\"model\":\"%s\","
+             "\"messages\":["
+               "{"
+                 "\"role\":\"system\","
+                 "\"content\":\"%s\""
+               "},"
+               "{"
+                 "\"role\":\"user\","
+                 "\"content\":\"%s\""
+               "}"
+             "]"
+             "}",
+             model,
+             OPENAI_SYSTEM_PROMPT,
+             toon);
+}
+
+// -------------------- Session summary for TOON + OpenAI --------------------
+
+typedef struct {
+    uint32_t session_id;      // monotonically increasing
+    float    total_time_s;    // duration of session in seconds
+    int      reps;            // total reps counted
+    float    imbalance_deg;   // |end_angle - start_angle|
+} repsense_session_t;
+
+static uint32_t g_session_counter = 0;  // increments every STOP
+
+// Simple TOON serialization (custom non-JSON text)
+static void build_session_toon(const repsense_session_t *s,
+                               char *out,
+                               size_t out_size)
+{
+    if (!s || !out || out_size == 0) {
+        return;
+    }
+
+    snprintf(out, out_size,
+             "RepSenseToon v1\n"
+             "session_id: %lu\n"
+             "time_s: %.2f\n"
+             "reps: %d\n"
+             "imbalance_deg: %.2f\n",
+             (unsigned long)s->session_id,
+             s->total_time_s,
+             s->reps,
+             s->imbalance_deg);
+}
+
+// -------------------- JSON string escaping --------------------
+// Escapes \, ", and control chars like newline so we can embed strings
+// safely inside JSON.
+
+static void json_escape_string(const char *in, char *out, size_t out_size)
+{
+    if (!in || !out || out_size == 0) {
+        return;
+    }
+
+    size_t o = 0;
+    const size_t max = out_size - 1; // leave room for '\0'
+
+    while (*in && o < max) {
+        unsigned char c = (unsigned char)*in++;
+
+        if (c == '\\' || c == '\"') {
+            if (o + 2 > max) break;
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c == '\n') {
+            if (o + 2 > max) break;
+            out[o++] = '\\';
+            out[o++] = 'n';
+        } else if (c == '\r') {
+            if (o + 2 > max) break;
+            out[o++] = '\\';
+            out[o++] = 'r';
+        } else if (c == '\t') {
+            if (o + 2 > max) break;
+            out[o++] = '\\';
+            out[o++] = 't';
+        } else if (c < 0x20) {
+            // Other control chars -> simple \n-style is fine to ignore here,
+            // or we could emit \u00XX. For this data, it shouldn't appear.
+            // We will just skip them to keep JSON valid.
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+
+    out[o] = '\0';
+}
+
+// -------------------- Build Chat Completions JSON body --------------------
+
+static void build_openai_chat_body(const char *toon,
+                                   char *out,
+                                   size_t out_size)
+{
+    if (!toon || !out || out_size == 0) {
+        return;
+    }
+
+    char esc_sys[512];
+    char esc_user[512];
+
+    json_escape_string(OPENAI_SYSTEM_PROMPT, esc_sys, sizeof(esc_sys));
+    json_escape_string(toon,                 esc_user, sizeof(esc_user));
+
+    // JSON:
+    // {
+    //   "model": "gpt-4.1-mini",
+    //   "messages": [
+    //     {"role":"system","content":"..."},
+    //     {"role":"user","content":"RepSenseToon v1\n..."}
+    //   ]
+    // }
+
+    snprintf(out, out_size,
+             "{"
+               "\"model\":\"%s\","
+               "\"messages\":["
+                 "{"
+                   "\"role\":\"system\","
+                   "\"content\":\"%s\""
+                 "},"
+                 "{"
+                   "\"role\":\"user\","
+                   "\"content\":\"%s\""
+                 "}"
+               "]"
+             "}",
+             OPENAI_MODEL_NAME,
+             esc_sys,
+             esc_user);
+}
+
+// ----------------------------------------------------
 // Session control
 // ----------------------------------------------------
 
@@ -496,39 +891,61 @@ static void start_session(void)
 
 static void stop_session(void)
 {
-    if (!session_running) return;
+    if (!session_running) {
+        return;
+    }
 
+    // Mark session as stopped
     session_running = false;
 
+    // -------------------- Compute duration --------------------
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us  = now_us - session_start_us;
-    if (dt_us < 0) dt_us = 0;
+    if (dt_us < 0) {
+        dt_us = 0;
+    }
     float seconds = (float)dt_us / 1e6f;
 
+    // -------------------- Compute imbalance --------------------
     // Imbalance: angle drift from baseline to last measured angle
     float imbalance_deg = fabsf(last_angle_deg - baseline_angle_deg);
 
-    // Build session summary struct for TOON export
+    // -------------------- Build session summary --------------------
     repsense_session_t sess = {
-        .session_id     = ++g_session_counter,
+        .session_id     = ++g_session_counter,  // increment global counter
         .total_time_s   = seconds,
         .reps           = rep_count,
         .imbalance_deg  = imbalance_deg,
     };
 
-    // Build TOON payload (in-memory only for now)
+    // -------------------- Build TOON payload --------------------
     char toon_buf[256];
+    memset(toon_buf, 0, sizeof(toon_buf));
     build_session_toon(&sess, toon_buf, sizeof(toon_buf));
 
-    // For now, just log it. Later, we'll send toon_buf over Wi-Fi
-    // to the OpenAI ChatGPT API, or write it to flash.
+    // -------------------- Build OpenAI JSON body --------------------
+    char openai_body[1024];
+    memset(openai_body, 0, sizeof(openai_body));
+    build_openai_chat_body(toon_buf, openai_body, sizeof(openai_body));
+
+    // -------------------- Log summary + payloads --------------------
     ESP_LOGI(TAG,
              "Session STOP: time = %.2f s, reps = %d, imbalance = %.2f deg",
              seconds, rep_count, imbalance_deg);
     ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
+    ESP_LOGI(TAG, "OpenAI Chat body:\n%s", openai_body);
 
+    // -------------------- Send to OpenAI (if Wi-Fi ready) --------------------
+    esp_err_t res = openai_send_chat_request(openai_body);
+    if (res != ESP_OK) {
+        ESP_LOGW(TAG, "OpenAI request failed (err=%s)",
+                 esp_err_to_name(res));
+    }
+
+    // -------------------- Update on-screen UI --------------------
     update_labels_done(seconds, imbalance_deg);
 }
+
 
 // ----------------------------------------------------
 // Rep detection using vertical acceleration (bench press)
@@ -763,24 +1180,36 @@ static void button_task(void *arg)
 
 void app_main(void)
 {
-    // Display + LVGL
+    esp_err_t ret;
+
+    // -------------------- NVS init (needed for Wi-Fi etc.) --------------------
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // -------------------- Display + LVGL --------------------
     disp = gui_setup();
 
     lvgl_port_lock(0);
     create_main_screen();
     lvgl_port_unlock();
 
+    // Initial status on screen
     update_labels_idle("INIT I2C/IMU...");
 
-    // I2C
-    esp_err_t ret = i2c_master_init();
+    // -------------------- I2C --------------------
+    ret = i2c_master_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
         update_labels_idle("I2C ERROR");
         return;
     }
 
-    // IMU
+    // -------------------- IMU --------------------
     ret = imu_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "IMU init failed: %s", esp_err_to_name(ret));
@@ -788,11 +1217,27 @@ void app_main(void)
         return;
     }
 
-    // Button + tasks
+    // -------------------- Button + tasks --------------------
     button_init();
 
+    // IMU sampling / rep detection
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
-    xTaskCreate(button_task, "button_task", 4096, NULL, 6, NULL); # Changed, it was giving stack overflow !!!
+
+    // Physical button: START/STOP. Stack bumped to 4096 to avoid overflow.
+    xTaskCreate(button_task, "button_task", 4096, NULL, 6, NULL);
 
     ESP_LOGI(TAG, "RepSense ready – press the button to START/STOP");
+
+    // -------------------- Wi-Fi: connect to DukeOpen (non-fatal) --------------------
+    ret = wifi_connect_dukeopen();
+    if (ret != ESP_OK) {
+        ESP_LOGW("WiFi",
+                 "Could not connect to SSID:%s. "
+                 "Continuing without Wi-Fi; OpenAI calls will be skipped.",
+                 WIFI_SSID);
+    } else {
+        ESP_LOGI("WiFi", "Wi-Fi connected to %s, OpenAI ready", WIFI_SSID);
+    }
+
+    // Nothing else to do in app_main; tasks run in the background.
 }
