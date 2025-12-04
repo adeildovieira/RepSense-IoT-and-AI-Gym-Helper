@@ -331,18 +331,6 @@ static float rep_peak_abs_vert = 0.0f;
 // IMU I2C address
 static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
 
-// -------------------- Session summary for TOON export --------------------
-
-typedef struct {
-    uint32_t session_id;      // monotonically increasing
-    float    total_time_s;    // duration of session in seconds
-    int      reps;            // total reps counted
-    float    imbalance_deg;   // |end_angle - start_angle|
-} repsense_session_t;
-
-static uint32_t g_session_counter = 0;  // increments every STOP
-
-
 // -------------------- LVGL OBJECTS --------------------
 
 static lv_disp_t *disp         = NULL;
@@ -644,97 +632,6 @@ static void create_main_screen(void)
     lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 110);
 
     update_labels_idle("READY");
-}
-
-// ----------------------------------------------------
-// TOON serialization (custom text format, not JSON)
-// ----------------------------------------------------
-//
-// Example output:
-//
-// RepSenseToon v1
-// session_id: 3
-// time_s: 42.62
-// reps: 10
-// imbalance_deg: 0.73
-//
-
-static void build_session_toon(const repsense_session_t *s,
-                               char *out,
-                               size_t out_size)
-{
-    if (!s || !out || out_size == 0) {
-        return;
-    }
-
-    // Very small, deterministic text format for later ChatGPT parsing.
-    // One key per line, no braces, no JSON.
-    snprintf(out, out_size,
-             "RepSenseToon v1\n"
-             "session_id: %lu\n"
-             "time_s: %.2f\n"
-             "reps: %d\n"
-             "imbalance_deg: %.2f\n",
-             (unsigned long)s->session_id,
-             s->total_time_s,
-             s->reps,
-             s->imbalance_deg);
-}
-
-// ----------------------------------------------------
-// Build JSON body for OpenAI Chat Completions API
-// ----------------------------------------------------
-//
-// We still use TOON as the *user content*, but the API itself
-// always expects JSON as transport.
-//
-// NOTE: This just builds the JSON string. Sending it over HTTPS
-// will be done later via esp_http_client.
-//
-
-static void build_openai_chat_body(const char *toon,
-                                   char *out,
-                                   size_t out_size)
-{
-    if (!toon || !out || out_size == 0) {
-        return;
-    }
-
-    // For simplicity, we rely on the fact that the Toon format
-    // does not contain double quotes. Newlines are embedded literally.
-    // If you ever add quotes to Toon, we should escape them.
-
-    // Model name can be adjusted later (e.g., "gpt-4.1-mini").
-    const char *model = "gpt-4.1-mini";
-
-    // Basic JSON body:
-    // {
-    //   "model": "...",
-    //   "messages": [
-    //     {"role": "system", "content": "..."},
-    //     {"role": "user",   "content": "RepSenseToon v1\n..."}
-    //   ]
-    // }
-
-    // We use snprintf to keep within out_size.
-    // Toon is inserted as-is inside the user content string.
-    snprintf(out, out_size,
-             "{"
-             "\"model\":\"%s\","
-             "\"messages\":["
-               "{"
-                 "\"role\":\"system\","
-                 "\"content\":\"%s\""
-               "},"
-               "{"
-                 "\"role\":\"user\","
-                 "\"content\":\"%s\""
-               "}"
-             "]"
-             "}",
-             model,
-             OPENAI_SYSTEM_PROMPT,
-             toon);
 }
 
 // -------------------- Session summary for TOON + OpenAI --------------------
