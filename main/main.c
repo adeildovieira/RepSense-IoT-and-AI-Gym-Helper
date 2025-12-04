@@ -92,6 +92,10 @@ static float          g_unit_x             = 0.0f;
 static float          g_unit_y             = 0.0f;
 static float          g_unit_z             = 0.0f;
 
+// Baseline & last angle (for imbalance)
+static float baseline_angle_deg = 0.0f;
+static float last_angle_deg     = 0.0f;
+
 // Rep statistics
 static int   rep_count     = 0;
 
@@ -369,7 +373,7 @@ static void update_labels_running(void)
     lvgl_port_unlock();
 }
 
-static void update_labels_done(float total_time_s)
+static void update_labels_done(float total_time_s, float imbalance_deg)
 {
     if (!label_status || !label_time || !label_reps) return;
 
@@ -377,7 +381,8 @@ static void update_labels_done(float total_time_s)
     lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf),
-             "RepSense: DONE\nPress button to START again");
+             "RepSense: DONE\nImbalance: %.1f deg\nPress button to START again",
+             imbalance_deg);
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
@@ -425,9 +430,11 @@ static void start_session(void)
 
     ESP_LOGI(TAG, "Session START");
 
-    baseline_ready   = false;
-    baseline_acc_g   = 0.0f;
+    baseline_ready    = false;
+    baseline_acc_g    = 0.0f;
     g_unit_x = g_unit_y = g_unit_z = 0.0f;
+    baseline_angle_deg = 0.0f;
+    last_angle_deg     = 0.0f;
 
     reset_rep_state();
 
@@ -448,9 +455,14 @@ static void stop_session(void)
     if (dt_us < 0) dt_us = 0;
     float seconds = (float)dt_us / 1e6f;
 
-    ESP_LOGI(TAG, "Session STOP: time = %.2f s, reps = %d", seconds, rep_count);
+    // Imbalance: angle drift from baseline to last measured angle
+    float imbalance_deg = fabsf(last_angle_deg - baseline_angle_deg);
 
-    update_labels_done(seconds);
+    ESP_LOGI(TAG,
+             "Session STOP: time = %.2f s, reps = %d, imbalance = %.2f deg",
+             seconds, rep_count, imbalance_deg);
+
+    update_labels_done(seconds, imbalance_deg);
 }
 
 // ----------------------------------------------------
@@ -523,6 +535,16 @@ static void rep_update_from_vertical(float a_vert)
 // IMU sampling task
 // ----------------------------------------------------
 
+// Simple pitch-like angle from accelerometer (degrees)
+static float compute_angle_deg(float ax_g, float ay_g, float az_g)
+{
+    // pitch = atan2(-ax, sqrt(ay^2 + az^2))
+    float denom = sqrtf(ay_g * ay_g + az_g * az_g);
+    if (denom < 1e-6f) denom = 1e-6f;
+    float pitch_rad = atan2f(-ax_g, denom);
+    return pitch_rad * 180.0f / (float)M_PI;
+}
+
 static void imu_task(void *arg)
 {
     (void)arg;
@@ -586,15 +608,23 @@ static void imu_task(void *arg)
                 g_unit_y = avg_ay / baseline_acc_g;
                 g_unit_z = avg_az / baseline_acc_g;
 
+                // Baseline pitch angle (for imbalance)
+                baseline_angle_deg = compute_angle_deg(avg_ax, avg_ay, avg_az);
+                last_angle_deg     = baseline_angle_deg;  // start here
+
                 baseline_ready = true;
                 ESP_LOGI(TAG,
-                         "Baseline |acc| = %.3f g, g_unit=(%.3f, %.3f, %.3f)",
-                         baseline_acc_g, g_unit_x, g_unit_y, g_unit_z);
+                         "Baseline |acc| = %.3f g, g_unit=(%.3f, %.3f, %.3f), angle=%.2f deg",
+                         baseline_acc_g, g_unit_x, g_unit_y, g_unit_z, baseline_angle_deg);
             }
+
         } else {
             // Vertical acceleration along gravity
             float proj   = ax_g * g_unit_x + ay_g * g_unit_y + az_g * g_unit_z;
             float a_vert = proj - baseline_acc_g;   // dynamic vertical accel
+
+            // Update last angle for imbalance
+            last_angle_deg = compute_angle_deg(ax_g, ay_g, az_g);
 
             rep_update_from_vertical(a_vert);
 
@@ -603,8 +633,8 @@ static void imu_task(void *arg)
             if (dbg_counter >= 10) {
                 dbg_counter = 0;
                 ESP_LOGI(TAG,
-                         "a_vert=%.3f g, reps=%d, running=%d",
-                         a_vert, rep_count, session_running ? 1 : 0);
+                        "a_vert=%.3f g, angle=%.2f deg, reps=%d, running=%d",
+                        a_vert, last_angle_deg, rep_count, session_running ? 1 : 0);
             }
         }
 
@@ -697,7 +727,7 @@ void app_main(void)
     button_init();
 
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
-    xTaskCreate(button_task, "button_task", 2048, NULL, 6, NULL);
+    xTaskCreate(button_task, "button_task", 4096, NULL, 6, NULL); # Changed, it was giving stack overflow !!!
 
     ESP_LOGI(TAG, "RepSense ready – press the button to START/STOP");
 }
