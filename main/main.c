@@ -54,6 +54,7 @@ static const char *TAG = "RepSense";
 // This is fine for local testing / class demos.
 
 #define OPENAI_API_KEY "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"
+#define OPENAI_AUTH_HEADER "Bearer " OPENAI_API_KEY
 
 // Model name for chat completions
 static const char *OPENAI_MODEL_NAME = "gpt-5-mini";
@@ -267,11 +268,8 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         return ESP_FAIL;
     }
 
-    // Authorization header: "Bearer sk-..."
-    char auth_header[160];
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
-
-    esp_http_client_set_header(client, "Authorization", auth_header);
+    // No snprintf, no truncation warning:
+    esp_http_client_set_header(client, "Authorization", OPENAI_AUTH_HEADER);
     esp_http_client_set_header(client, "Content-Type", "application/json");
 
     esp_http_client_set_post_field(client, json_body, strlen(json_body));
@@ -283,11 +281,10 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         ESP_LOGI("OpenAI", "HTTP status = %d, content length = %d",
                  status, len);
 
-        // Read and log up to 500 bytes of the response
         char resp_buf[512];
-        int  read_len = esp_http_client_read(client,
-                                             resp_buf,
-                                             sizeof(resp_buf) - 1);
+        int read_len = esp_http_client_read(client,
+                                            resp_buf,
+                                            sizeof(resp_buf) - 1);
         if (read_len > 0) {
             resp_buf[read_len] = '\0';
             ESP_LOGI("OpenAI", "Response (truncated): %s", resp_buf);
@@ -301,6 +298,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     esp_http_client_cleanup(client);
     return err;
 }
+
 
 // -------------------- GLOBAL SESSION STATE --------------------
 
@@ -667,8 +665,6 @@ static void build_session_toon(const repsense_session_t *s,
 }
 
 // -------------------- JSON string escaping --------------------
-// Escapes \, ", and control chars like newline so we can embed strings
-// safely inside JSON.
 
 static void json_escape_string(const char *in, char *out, size_t out_size)
 {
@@ -677,7 +673,7 @@ static void json_escape_string(const char *in, char *out, size_t out_size)
     }
 
     size_t o = 0;
-    const size_t max = out_size - 1; // leave room for '\0'
+    const size_t max = out_size - 1;
 
     while (*in && o < max) {
         unsigned char c = (unsigned char)*in++;
@@ -699,9 +695,6 @@ static void json_escape_string(const char *in, char *out, size_t out_size)
             out[o++] = '\\';
             out[o++] = 't';
         } else if (c < 0x20) {
-            // Other control chars -> simple \n-style is fine to ignore here,
-            // or we could emit \u00XX. For this data, it shouldn't appear.
-            // We will just skip them to keep JSON valid.
         } else {
             out[o++] = (char)c;
         }
