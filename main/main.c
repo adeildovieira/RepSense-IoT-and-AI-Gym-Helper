@@ -12,6 +12,9 @@
 #include <string.h>
 #include <math.h>
 
+#include <stdint.h>
+
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -108,6 +111,18 @@ static float rep_peak_abs_vert = 0.0f;
 
 // IMU I2C address
 static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
+
+// -------------------- Session summary for TOON export --------------------
+
+typedef struct {
+    uint32_t session_id;      // monotonically increasing
+    float    total_time_s;    // duration of session in seconds
+    int      reps;            // total reps counted
+    float    imbalance_deg;   // |end_angle - start_angle|
+} repsense_session_t;
+
+static uint32_t g_session_counter = 0;  // increments every STOP
+
 
 // -------------------- LVGL OBJECTS --------------------
 
@@ -413,6 +428,41 @@ static void create_main_screen(void)
 }
 
 // ----------------------------------------------------
+// TOON serialization (custom text format, not JSON)
+// ----------------------------------------------------
+//
+// Example output:
+//
+// RepSenseToon v1
+// session_id: 3
+// time_s: 42.62
+// reps: 10
+// imbalance_deg: 0.73
+//
+
+static void build_session_toon(const repsense_session_t *s,
+                               char *out,
+                               size_t out_size)
+{
+    if (!s || !out || out_size == 0) {
+        return;
+    }
+
+    // Very small, deterministic text format for later ChatGPT parsing.
+    // One key per line, no braces, no JSON.
+    snprintf(out, out_size,
+             "RepSenseToon v1\n"
+             "session_id: %lu\n"
+             "time_s: %.2f\n"
+             "reps: %d\n"
+             "imbalance_deg: %.2f\n",
+             (unsigned long)s->session_id,
+             s->total_time_s,
+             s->reps,
+             s->imbalance_deg);
+}
+
+// ----------------------------------------------------
 // Session control
 // ----------------------------------------------------
 
@@ -458,9 +508,24 @@ static void stop_session(void)
     // Imbalance: angle drift from baseline to last measured angle
     float imbalance_deg = fabsf(last_angle_deg - baseline_angle_deg);
 
+    // Build session summary struct for TOON export
+    repsense_session_t sess = {
+        .session_id     = ++g_session_counter,
+        .total_time_s   = seconds,
+        .reps           = rep_count,
+        .imbalance_deg  = imbalance_deg,
+    };
+
+    // Build TOON payload (in-memory only for now)
+    char toon_buf[256];
+    build_session_toon(&sess, toon_buf, sizeof(toon_buf));
+
+    // For now, just log it. Later, we'll send toon_buf over Wi-Fi
+    // to the OpenAI ChatGPT API, or write it to flash.
     ESP_LOGI(TAG,
              "Session STOP: time = %.2f s, reps = %d, imbalance = %.2f deg",
              seconds, rep_count, imbalance_deg);
+    ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
 
     update_labels_done(seconds, imbalance_deg);
 }
