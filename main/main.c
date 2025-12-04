@@ -641,6 +641,7 @@ static void button_task(void *arg)
 
 void app_main(void)
 {
+    // 1) NVS init (same as labs)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -648,15 +649,35 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_ERROR_CHECK(i2c_master_init());
-    ESP_ERROR_CHECK(icm20600_init());
-
+    // 2) Display + LVGL (exactly like Lab 4)
     disp = gui_setup();
 
+    // Create our labels
     lvgl_port_lock(0);
     create_main_screen();
     lvgl_port_unlock();
 
+    // Show "init" status
+    update_labels_idle("INIT I2C/IMU...");
+
+    // 3) I2C init (NON-fatal)
+    ret = i2c_master_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
+        update_labels_idle("I2C ERROR");
+        // We can stop here; display stays on with error message
+        return;
+    }
+
+    // 4) IMU init (NON-fatal)
+    ret = icm20600_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "IMU init failed: %s", esp_err_to_name(ret));
+        update_labels_idle("IMU ERROR");
+        return;
+    }
+
+    // 5) Button + tasks
     button_init();
 
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
