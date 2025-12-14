@@ -5,6 +5,8 @@
 #include <string.h>
 #include <math.h>
 
+#include "sdkconfig.h"
+
 #include "esp_sntp.h"
 #include <time.h>
 #include <sys/time.h>
@@ -54,13 +56,16 @@ static const char *TAG_OPENAI = "OpenAI";
 // OpenAI connections:
 #define OPENAI_BODY_MAX_LEN 2048
 
+#ifndef CONFIG_OPENAI_API_KEY
+#define CONFIG_OPENAI_API_KEY ""
+#endif
+
 static TaskHandle_t      g_openai_task_handle = NULL;
 static SemaphoreHandle_t g_openai_mutex      = NULL;
 static char              g_openai_body_buf[OPENAI_BODY_MAX_LEN];
 static bool              g_openai_body_valid = false;
 
-#define OPENAI_API_KEY "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"
-#define OPENAI_ENDPOINT "https://api.openai.com/v1/chat/completions"
+#define OPENAI_API_KEY CONFIG_OPENAI_API_KEY
 #define OPENAI_MODEL "gpt-4o-mini" // using this one since 5 was not getting through
 
 #define I2C_MASTER_SCL_IO          40
@@ -248,11 +253,21 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// open ai https requests:
+static esp_err_t openai_send_chat_request(const char *json_body)
 {
     if (!json_body) {
         ESP_LOGE(TAG_OPENAI, "No JSON body provided");
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!OPENAI_API_KEY || strlen(OPENAI_API_KEY) == 0) {
+        ESP_LOGE(TAG_OPENAI, "OpenAI API key is not set (configure CONFIG_OPENAI_API_KEY)");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!g_wifi_ready) {
+        ESP_LOGW(TAG_OPENAI, "Wi-Fi not ready; skipping OpenAI request");
+        return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
