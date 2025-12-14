@@ -1,18 +1,18 @@
-// main.c – RepSense Lite
-// ESP32-S3-BOX-3 + Grove IMU 9DOF (0x68)
-// Bench press rep counter using vertical acceleration (relative to gravity)
-//
-// - Display init matches Lab 4 (esp32s3_box_lcd_config.h).
-// - I2C IMU on SCL=GPIO40, SDA=GPIO41.
-// - Button on GPIO10 toggles START/STOP.
-// - Calibrates gravity direction, uses vertical accel for reps.
-// - Minimal UI: status, time, reps (no ROM / no sample buffer).
+// RepSense
+// Adeildo Vieira (av259)
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
+
 #include <stdint.h>
+
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 
 #include "nvs_flash.h"
 #include "esp_netif.h"
@@ -24,6 +24,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -48,41 +49,19 @@
 #endif
 
 static const char *TAG = "RepSense";
+static const char *TAG_OPENAI = "OpenAI";
 
-// -------------------- OpenAI API key (demo) --------------------
-// NOTE: For a real project, do NOT commit the real key to Git.
-// This is fine for local testing / class demos.
+// OpenAI connections:
+#define OPENAI_BODY_MAX_LEN 2048
+
+static TaskHandle_t      g_openai_task_handle = NULL;
+static SemaphoreHandle_t g_openai_mutex      = NULL;
+static char              g_openai_body_buf[OPENAI_BODY_MAX_LEN];
+static bool              g_openai_body_valid = false;
 
 #define OPENAI_API_KEY "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"
-#define OPENAI_AUTH_HEADER "Bearer " OPENAI_API_KEY
-
-// Model name for chat completions
-static const char *OPENAI_MODEL_NAME = "gpt-5-mini";
-
-//
-// -------------------- OpenAI ChatGPT config --------------------
-
-static const char *OPENAI_SYSTEM_PROMPT =
-    "You are RepSense, an AI gym coach.\n"
-    "The user will send you workout sets in a custom text format "
-    "called 'RepSenseToon v1'. Each Toon includes:\n"
-    "- session_id: integer ID of the set\n"
-    "- time_s: duration of the set in seconds\n"
-    "- reps: total bench press reps counted\n"
-    "- imbalance_deg: absolute angle drift in degrees between start and end.\n"
-    "\n"
-    "DO NOT HALLUCINATE or make up any data; only use what is provided.\n"
-    "DO NOT ASK QUESTIONS; only provide feedback based on the data.\n"
-    "Your job is to:\n"
-    "1) Briefly assess the set (effort, volume, and bar symmetry).\n"
-    "2) Briefly comment on whether the imbalance_deg is concerning or fine.\n"
-    "3) Give 1–2 concrete tips for the next set.\n"
-    "Respond in **at most 3 short bullet points**, friendly and encouraging, "
-    "no emojis.";
-
-//
-
-// -------------------- I2C / IMU DEFINES --------------------
+#define OPENAI_ENDPOINT "https://api.openai.com/v1/chat/completions"
+#define OPENAI_MODEL "gpt-4o-mini" // using this one since 5 was not getting through
 
 #define I2C_MASTER_SCL_IO          40
 #define I2C_MASTER_SDA_IO          41
@@ -92,7 +71,6 @@ static const char *OPENAI_SYSTEM_PROMPT =
 
 #define IMU_ADDR_DEFAULT           0x68
 
-// IMU registers (ICM/MPU family)
 #define REG_SMPLRT_DIV             0x19
 #define REG_CONFIG                 0x1A
 #define REG_GYRO_CONFIG            0x1B
@@ -102,34 +80,28 @@ static const char *OPENAI_SYSTEM_PROMPT =
 #define REG_WHO_AM_I               0x75
 #define REG_ACCEL_XOUT_H           0x3B
 
-// Accel scale: assume ±4 g -> 8192 LSB/g
+// ±4 g -> 8192 LSB/g
 #define ACCEL_LSB_PER_G_4G         8192.0f
 
-// -------------------- BUTTON GPIO --------------------
-
 #define BUTTON_GPIO                10
-
-// -------------------- SAMPLING / SESSION PARAMS --------------------
 
 #define SAMPLE_RATE_HZ             100
 #define SAMPLE_PERIOD_MS           (1000 / SAMPLE_RATE_HZ)
 
-#define CALIB_SAMPLES              100   // ~1 s of calibration at 100 Hz
+#define CALIB_SAMPLES              100   //using ~1 s of calibration at 100 Hz
 
-// Vertical-accel based rep detection (bench press)
-#define VERT_SIGN_DEADZONE_G       0.02f   // ignore tiny noise
-#define VERT_MOTION_THRESH_G       0.02f   // start rep if |a_vert| >= this
-#define VERT_RETURN_THRESH_G       0.02f   // "back to baseline" if |a_vert| <= this
+// Acceleration (VERTICAL) for bench press mov.
+#define VERT_SIGN_DEADZONE_G       0.02f   // tiny noise being ignored
+#define VERT_MOTION_THRESH_G       0.02f   // starting rep if our |a_vert| >= this one
+#define VERT_RETURN_THRESH_G       0.02f   // back to baseline of that specific person/set if |a_vert| <= this one
 
-// New: rep must reach at least this peak vertical accel to be valid
-#define VERT_PEAK_MIN_G            0.075f   // require >= 0.075 g at some point in the rep
+#define VERT_PEAK_MIN_G            0.075f   // it requires >= 0.075 g at some point in the rep
 
-// If you really want a ROM threshold, we’d need angle; here we focus on reps only.
 
-// -------------------- Wi-Fi (DukeOpen) --------------------
+// WiFi configuration (same as Lab 4)
 
 #define WIFI_SSID "DukeOpen"
-#define WIFI_PASS ""      // open network
+#define WIFI_PASS ""
 
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
@@ -169,7 +141,6 @@ static void wifi_event_handler(void *arg,
 static esp_err_t wifi_connect_dukeopen(void)
 {
     if (g_wifi_ready) {
-        // Already connected or considered ready
         return ESP_OK;
     }
 
@@ -182,7 +153,6 @@ static esp_err_t wifi_connect_dukeopen(void)
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             return err;
         }
-
         err = esp_event_loop_create_default();
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             return err;
@@ -209,7 +179,6 @@ static esp_err_t wifi_connect_dukeopen(void)
         strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
                 sizeof(wifi_config.sta.password));
 
-        // Open network
         wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -219,6 +188,7 @@ static esp_err_t wifi_connect_dukeopen(void)
         g_wifi_inited = true;
     }
 
+    // text stuff:
     ESP_LOGI("WiFi", "Connecting to SSID:%s", WIFI_SSID);
 
     EventBits_t bits = xEventGroupWaitBits(
@@ -242,103 +212,233 @@ static esp_err_t wifi_connect_dukeopen(void)
     }
 }
 
-// -------------------- OpenAI HTTPS request --------------------
-
-static esp_err_t openai_send_chat_request(const char *json_body)
+static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
-    if (!json_body) return ESP_ERR_INVALID_ARG;
+    switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGE(TAG_OPENAI, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_CONNECTED - TLS handshake successful");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_HEADER: %s=%s",
+                 evt->header_key ? evt->header_key : "(null)",
+                 evt->header_value ? evt->header_value : "(null)");
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_DATA, len=%d data=%.*s",
+                 evt->data_len, 
+                 evt->data_len > 100 ? 100 : evt->data_len,
+                 (char *)evt->data);
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_FINISH");
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_DISCONNECTED");
+        break;
+    default:
+        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT: unknown event_id=%d", evt->event_id);
+        break;
+    }
+    return ESP_OK;
+}
 
-    if (!g_wifi_ready) {
-        ESP_LOGW("OpenAI", "Wi-Fi not ready, skipping OpenAI request");
-        return ESP_FAIL;
+// open ai https requests:
+{
+    if (!json_body) {
+        ESP_LOGE(TAG_OPENAI, "No JSON body provided");
+        return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGI("OpenAI", "Sending Chat Completions request...");
+    ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
+    ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
+    
+    time_t now = time(NULL);
+    struct tm *timeinfo = localtime(&now);
+    ESP_LOGI(TAG_OPENAI, "System time: %04d-%02d-%02d %02d:%02d:%02d",
+             timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
 
+    // HTTP client config for Chat Completions
     esp_http_client_config_t cfg = {
-        .url = "https://api.openai.com/v1/chat/completions",
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 15000,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .host                     = "api.openai.com",
+        .path                     = "/v1/chat/completions",
+        .method                   = HTTP_METHOD_POST,
+        .event_handler            = _http_event_handler,
+        .transport_type           = HTTP_TRANSPORT_OVER_SSL,
+
+        // For DukeOpen network - disable strict SSL for now
+        .skip_cert_common_name_check = true,
+        .crt_bundle_attach        = esp_crt_bundle_attach,
+        
+        .timeout_ms               = 20000,
+        .buffer_size              = 4096,
+        .disable_auto_redirect    = true,
+        .max_redirection_count    = 0,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        ESP_LOGE("OpenAI", "Failed to init HTTP client");
+        ESP_LOGE(TAG_OPENAI, "esp_http_client_init failed");
         return ESP_FAIL;
     }
 
-    // No snprintf, no truncation warning:
-    esp_http_client_set_header(client, "Authorization", OPENAI_AUTH_HEADER);
+    // Force HTTP/1.1 and set proper host header
+    esp_http_client_set_header(client, "Host", "api.openai.com");
+    
+    // Headers
+    char auth_header[300];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
+    esp_http_client_set_header(client, "Authorization", auth_header);
     esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "User-Agent", "RepSense-ESP32");
+    esp_http_client_set_header(client, "Connection", "close");
+    
+    // Debug: verify URL path
+    char url_buf[256];
+    esp_http_client_get_url(client, url_buf, sizeof(url_buf));
+    ESP_LOGI(TAG_OPENAI, "Full URL being used: %s", url_buf);
+    
+    ESP_LOGI(TAG_OPENAI, "Authorization header set (key length: %d)", (int)strlen(OPENAI_API_KEY));
 
-    esp_http_client_set_post_field(client, json_body, strlen(json_body));
+    int body_len = strlen(json_body);
+    char content_length_str[32];
+    snprintf(content_length_str, sizeof(content_length_str), "%d", body_len);
+    esp_http_client_set_header(client, "Content-Length", content_length_str);
+    esp_http_client_set_post_field(client, json_body, body_len);
+    
+    ESP_LOGI(TAG_OPENAI, "Sending OpenAI request...");
 
     esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int status = esp_http_client_get_status_code(client);
-        int len    = esp_http_client_get_content_length(client);
-        ESP_LOGI("OpenAI", "HTTP status = %d, content length = %d",
-                 status, len);
-
-        char resp_buf[512];
-        int read_len = esp_http_client_read(client,
-                                            resp_buf,
-                                            sizeof(resp_buf) - 1);
-        if (read_len > 0) {
-            resp_buf[read_len] = '\0';
-            ESP_LOGI("OpenAI", "Response (truncated): %s", resp_buf);
-        } else {
-            ESP_LOGW("OpenAI", "No response body or read error");
-        }
-    } else {
-        ESP_LOGE("OpenAI", "Request failed: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_OPENAI, "HTTP perform error: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
     }
 
+    int status = esp_http_client_get_status_code(client);
+    int content_length = esp_http_client_get_content_length(client);
+    ESP_LOGI(TAG_OPENAI, "OpenAI HTTP status = %d, content_length = %d",
+             status, content_length);
+
+    char body[2048];
+    memset(body, 0, sizeof(body));
+    
+    int total_read = 0;
+    int r;
+    while ((r = esp_http_client_read_response(client, body + total_read, sizeof(body) - total_read - 1)) > 0) {
+        total_read += r;
+        if (total_read >= (int)sizeof(body) - 1) {
+            break;
+        }
+    }
+    
+    if (total_read > 0) {
+        body[total_read] = '\0';
+        ESP_LOGI(TAG_OPENAI, "Response received, total bytes: %d", total_read);
+        
+        if (total_read > 512) {
+            ESP_LOGI(TAG_OPENAI, "Response body (first 512): %.512s", body);
+            ESP_LOGI(TAG_OPENAI, "Response body (remaining): %.512s", body + 512);
+            if (total_read > 1024) {
+                ESP_LOGI(TAG_OPENAI, "Response body (end): %.512s", body + 1024);
+            }
+        } else {
+            ESP_LOGI(TAG_OPENAI, "Response body: %s", body);
+        }
+    } else {
+        ESP_LOGW(TAG_OPENAI, "No response body received (read returned %d), status=%d", r, status);
+    }
+
+    if (status / 100 != 2) {
+        ESP_LOGW(TAG_OPENAI, "========== HTTP ERROR ==========");
+        ESP_LOGW(TAG_OPENAI, "Status Code: %d", status);
+        
+        if (status >= 300 && status < 400) {
+            char location_buf[256];
+            if (esp_http_client_get_header(client, "Location", (char **)&location_buf) == ESP_OK) {
+                ESP_LOGW(TAG_OPENAI, "Redirect to: %s", location_buf);
+            }
+        }
+        
+        ESP_LOGW(TAG_OPENAI, "Response: %s", total_read > 0 ? body : "(empty)");
+        ESP_LOGW(TAG_OPENAI, "================================");
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG_OPENAI, "========== SUCCESS RESPONSE ==========");
+    ESP_LOGI(TAG_OPENAI, "Response: %s", body);
+    ESP_LOGI(TAG_OPENAI, "======================================");
+
     esp_http_client_cleanup(client);
-    return err;
+    return ESP_OK;
 }
 
+static void openai_task(void *pv)
+{
+    (void)pv;
 
-// -------------------- GLOBAL SESSION STATE --------------------
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (!g_openai_body_valid) {
+            continue;
+        }
+
+        char local_body[OPENAI_BODY_MAX_LEN];
+        local_body[0] = '\0';
+
+        if (g_openai_mutex &&
+            xSemaphoreTake(g_openai_mutex, portMAX_DELAY) == pdTRUE) {
+            strncpy(local_body, g_openai_body_buf, sizeof(local_body) - 1);
+            local_body[sizeof(local_body) - 1] = '\0';
+            g_openai_body_valid = false;
+            xSemaphoreGive(g_openai_mutex);
+        } else {
+            ESP_LOGW("OpenAI", "Failed to take mutex in openai_task");
+            continue;
+        }
+
+        esp_err_t err = openai_send_chat_request(local_body);
+        if (err != ESP_OK) {
+            ESP_LOGW("OpenAI", "openai_send_chat_request failed (err=%s)",
+                     esp_err_to_name(err));
+        }
+    }
+}
 
 static volatile bool     session_running   = false;
 static volatile int64_t  session_start_us  = 0;
 
-// Baseline gravity
 static volatile bool  baseline_ready       = false;
-static float          baseline_acc_g       = 0.0f;   // |g0|
+static float          baseline_acc_g       = 0.0f;
 static float          g_unit_x             = 0.0f;
 static float          g_unit_y             = 0.0f;
 static float          g_unit_z             = 0.0f;
 
-// Baseline & last angle (for imbalance)
 static float baseline_angle_deg = 0.0f;
 static float last_angle_deg     = 0.0f;
 
-// Rep statistics
 static int   rep_count     = 0;
 
-// Rep detection state
 static bool  rep_in_motion    = false;
 static int   direction_changes = 0;
 static int   last_sign         = 0;
 
 static float rep_peak_abs_vert = 0.0f;
 
-// IMU I2C address
 static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
-
-// -------------------- LVGL OBJECTS --------------------
 
 static lv_disp_t *disp         = NULL;
 static lv_obj_t  *label_status = NULL;
 static lv_obj_t  *label_time   = NULL;
 static lv_obj_t  *label_reps   = NULL;
-
-// ----------------------------------------------------
-// I2C INIT
-// ----------------------------------------------------
 
 static esp_err_t i2c_master_init(void)
 {
@@ -388,10 +488,6 @@ static void i2c_scan(void)
     ESP_LOGI(TAG, "I2C scan done");
 }
 
-// ----------------------------------------------------
-// IMU helpers
-// ----------------------------------------------------
-
 static esp_err_t imu_write_reg(uint8_t reg, uint8_t data)
 {
     uint8_t buf[2] = { reg, data };
@@ -431,32 +527,26 @@ static esp_err_t imu_init(void)
         ESP_LOGI(TAG, "Accepted IMU WHO_AM_I");
     }
 
-    // Wake up, use PLL
     ret = imu_write_reg(REG_PWR_MGMT_1, 0x01);
     if (ret != ESP_OK) goto fail;
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Gyro ±500 dps
     ret = imu_write_reg(REG_GYRO_CONFIG, 0x08);
     if (ret != ESP_OK) goto fail;
 
-    // Accel ±4 g
     ret = imu_write_reg(REG_ACCEL_CONFIG, 0x08);
     if (ret != ESP_OK) goto fail;
 
-    // Accel DLPF config
     ret = imu_write_reg(REG_ACCEL_CONFIG2, 0x0B);
     if (ret != ESP_OK) goto fail;
 
-    // Sample rate 100 Hz: 1kHz / (1+9)
     ret = imu_write_reg(REG_SMPLRT_DIV, 9);
     if (ret != ESP_OK) goto fail;
 
-    // CONFIG: DLPF 3
     ret = imu_write_reg(REG_CONFIG, 0x03);
     if (ret != ESP_OK) goto fail;
 
-    ESP_LOGI(TAG, "IMU initialized successfully at 0x%02X", g_imu_addr);
+    ESP_LOGI(TAG, "IMU initialized at 0x%02X", g_imu_addr);
     return ESP_OK;
 
 fail:
@@ -547,10 +637,6 @@ static lv_disp_t *gui_setup(void)
     return lvgl_port_add_disp(&disp_cfg);
 }
 
-// ----------------------------------------------------
-// LVGL UI helpers
-// ----------------------------------------------------
-
 static void update_labels_idle(const char *reason)
 {
     if (!label_status || !label_time || !label_reps) return;
@@ -632,18 +718,15 @@ static void create_main_screen(void)
     update_labels_idle("READY");
 }
 
-// -------------------- Session summary for TOON + OpenAI --------------------
-
 typedef struct {
-    uint32_t session_id;      // monotonically increasing
-    float    total_time_s;    // duration of session in seconds
-    int      reps;            // total reps counted
-    float    imbalance_deg;   // |end_angle - start_angle|
+    uint32_t session_id;
+    float    total_time_s;
+    int      reps;
+    float    imbalance_deg;
 } repsense_session_t;
 
-static uint32_t g_session_counter = 0;  // increments every STOP
+static uint32_t g_session_counter = 0;
 
-// Simple TOON serialization (custom non-JSON text)
 static void build_session_toon(const repsense_session_t *s,
                                char *out,
                                size_t out_size)
@@ -664,8 +747,6 @@ static void build_session_toon(const repsense_session_t *s,
              s->imbalance_deg);
 }
 
-// -------------------- JSON string escaping --------------------
-
 static void json_escape_string(const char *in, char *out, size_t out_size)
 {
     if (!in || !out || out_size == 0) {
@@ -673,37 +754,49 @@ static void json_escape_string(const char *in, char *out, size_t out_size)
     }
 
     size_t o = 0;
-    const size_t max = out_size - 1;
-
-    while (*in && o < max) {
-        unsigned char c = (unsigned char)*in++;
-
-        if (c == '\\' || c == '\"') {
-            if (o + 2 > max) break;
+    for (size_t i = 0; in[i] != '\0' && o + 2 < out_size; ++i) {
+        char c = in[i];
+        switch (c) {
+        case '\"':
+        case '\\':
+            if (o + 2 >= out_size) {
+                i = strlen(in);  // force exit
+                break;
+            }
             out[o++] = '\\';
-            out[o++] = (char)c;
-        } else if (c == '\n') {
-            if (o + 2 > max) break;
+            out[o++] = c;
+            break;
+        case '\n':
+            if (o + 2 >= out_size) {
+                i = strlen(in);
+                break;
+            }
             out[o++] = '\\';
             out[o++] = 'n';
-        } else if (c == '\r') {
-            if (o + 2 > max) break;
+            break;
+        case '\r':
+            if (o + 2 >= out_size) {
+                i = strlen(in);
+                break;
+            }
             out[o++] = '\\';
             out[o++] = 'r';
-        } else if (c == '\t') {
-            if (o + 2 > max) break;
+            break;
+        case '\t':
+            if (o + 2 >= out_size) {
+                i = strlen(in);
+                break;
+            }
             out[o++] = '\\';
             out[o++] = 't';
-        } else if (c < 0x20) {
-        } else {
-            out[o++] = (char)c;
+            break;
+        default:
+            out[o++] = c;
+            break;
         }
     }
-
     out[o] = '\0';
 }
-
-// -------------------- Build Chat Completions JSON body --------------------
 
 static void build_openai_chat_body(const char *toon,
                                    char *out,
@@ -713,43 +806,36 @@ static void build_openai_chat_body(const char *toon,
         return;
     }
 
-    char esc_sys[512];
-    char esc_user[512];
+    const char *system_prompt =
+        "You are RepSense, an AI gym coach. "
+        "The user will send you workout sets in a custom text format called 'RepSenseToon v1'. "
+        "Each Toon includes: session_id, time_s, reps, and imbalance_deg. "
+        "DO NOT HALLUCINATE or invent data. DO NOT ask questions. "
+        "Only give short, concrete feedback based on these fields. "
+        "1) Briefly assess the set (fatigue, pace, stability). "
+        "2) Comment on imbalance_deg in simple terms (left/right balance). "
+        "3) Suggest ONE short, practical tip for the next set. "
+        "Keep your response to 3 bullet points, max.";
 
-    json_escape_string(OPENAI_SYSTEM_PROMPT, esc_sys, sizeof(esc_sys));
-    json_escape_string(toon,                 esc_user, sizeof(esc_user));
+    char escaped_system[512];
+    json_escape_string(system_prompt, escaped_system, sizeof(escaped_system));
 
-    // JSON:
-    // {
-    //   "model": "gpt-4.1-mini",
-    //   "messages": [
-    //     {"role":"system","content":"..."},
-    //     {"role":"user","content":"RepSenseToon v1\n..."}
-    //   ]
-    // }
+    char escaped_toon[512];
+    json_escape_string(toon, escaped_toon, sizeof(escaped_toon));
 
     snprintf(out, out_size,
              "{"
                "\"model\":\"%s\","
                "\"messages\":["
-                 "{"
-                   "\"role\":\"system\","
-                   "\"content\":\"%s\""
-                 "},"
-                 "{"
-                   "\"role\":\"user\","
-                   "\"content\":\"%s\""
-                 "}"
-               "]"
+                 "{\"role\":\"system\",\"content\":\"%s\"},"
+                 "{\"role\":\"user\",\"content\":\"%s\"}"
+               "],"
+               "\"max_tokens\":150"
              "}",
-             OPENAI_MODEL_NAME,
-             esc_sys,
-             esc_user);
+             OPENAI_MODEL,
+             escaped_system,
+             escaped_toon);
 }
-
-// ----------------------------------------------------
-// Session control
-// ----------------------------------------------------
 
 static void reset_rep_state(void)
 {
@@ -785,10 +871,8 @@ static void stop_session(void)
         return;
     }
 
-    // Mark session as stopped
     session_running = false;
 
-    // -------------------- Compute duration --------------------
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us  = now_us - session_start_us;
     if (dt_us < 0) {
@@ -796,50 +880,45 @@ static void stop_session(void)
     }
     float seconds = (float)dt_us / 1e6f;
 
-    // -------------------- Compute imbalance --------------------
-    // Imbalance: angle drift from baseline to last measured angle
     float imbalance_deg = fabsf(last_angle_deg - baseline_angle_deg);
 
-    // -------------------- Build session summary --------------------
     repsense_session_t sess = {
-        .session_id     = ++g_session_counter,  // increment global counter
+        .session_id     = ++g_session_counter,
         .total_time_s   = seconds,
         .reps           = rep_count,
         .imbalance_deg  = imbalance_deg,
     };
 
-    // -------------------- Build TOON payload --------------------
     char toon_buf[256];
-    memset(toon_buf, 0, sizeof(toon_buf));
     build_session_toon(&sess, toon_buf, sizeof(toon_buf));
 
-    // -------------------- Build OpenAI JSON body --------------------
     char openai_body[1024];
-    memset(openai_body, 0, sizeof(openai_body));
     build_openai_chat_body(toon_buf, openai_body, sizeof(openai_body));
 
-    // -------------------- Log summary + payloads --------------------
     ESP_LOGI(TAG,
              "Session STOP: time = %.2f s, reps = %d, imbalance = %.2f deg",
              seconds, rep_count, imbalance_deg);
     ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
     ESP_LOGI(TAG, "OpenAI Chat body:\n%s", openai_body);
 
-    // -------------------- Send to OpenAI (if Wi-Fi ready) --------------------
-    esp_err_t res = openai_send_chat_request(openai_body);
-    if (res != ESP_OK) {
-        ESP_LOGW(TAG, "OpenAI request failed (err=%s)",
-                 esp_err_to_name(res));
+    if (g_openai_task_handle && g_openai_mutex) {
+        if (xSemaphoreTake(g_openai_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            strncpy(g_openai_body_buf, openai_body,
+                    sizeof(g_openai_body_buf) - 1);
+            g_openai_body_buf[sizeof(g_openai_body_buf) - 1] = '\0';
+            g_openai_body_valid = true;
+            xSemaphoreGive(g_openai_mutex);
+
+            xTaskNotifyGive(g_openai_task_handle);
+        } else {
+            ESP_LOGW("OpenAI", "Could not take mutex to queue OpenAI request");
+        }
+    } else {
+        ESP_LOGW("OpenAI", "OpenAI task not ready; skipping request");
     }
 
-    // -------------------- Update on-screen UI --------------------
     update_labels_done(seconds, imbalance_deg);
 }
-
-
-// ----------------------------------------------------
-// Rep detection using vertical acceleration (bench press)
-// ----------------------------------------------------
 
 static void rep_update_from_vertical(float a_vert)
 {
@@ -872,7 +951,6 @@ static void rep_update_from_vertical(float a_vert)
             rep_peak_abs_vert = abs_vert;
         }
 
-        // Direction change: sign flip of vertical accel
         if (sign != 0 && last_sign != 0 && sign != last_sign) {
             direction_changes++;
             ESP_LOGI(TAG, "Direction change %d (sign %d -> %d, a_vert=%.3f)",
@@ -880,21 +958,16 @@ static void rep_update_from_vertical(float a_vert)
             last_sign = sign;
         }
 
-        // If we've seen at least 2 direction changes and come back near baseline,
-        // we treat that as a *candidate* rep.
         if (direction_changes >= 2 && abs_vert <= VERT_RETURN_THRESH_G) {
             if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
-                // Valid rep: sufficiently strong
                 rep_count++;
                 ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
             } else {
-                // Too weak: likely noise
                 ESP_LOGI(TAG,
                          "Motion ended but peak |a_vert|=%.3f g < %.3f g (not counting)",
                          rep_peak_abs_vert, VERT_PEAK_MIN_G);
             }
 
-            // Reset motion state
             rep_in_motion      = false;
             direction_changes  = 0;
             last_sign          = 0;
@@ -903,14 +976,8 @@ static void rep_update_from_vertical(float a_vert)
     }
 }
 
-// ----------------------------------------------------
-// IMU sampling task
-// ----------------------------------------------------
-
-// Simple pitch-like angle from accelerometer (degrees)
 static float compute_angle_deg(float ax_g, float ay_g, float az_g)
 {
-    // pitch = atan2(-ax, sqrt(ay^2 + az^2))
     float denom = sqrtf(ay_g * ay_g + az_g * az_g);
     if (denom < 1e-6f) denom = 1e-6f;
     float pitch_rad = atan2f(-ax_g, denom);
@@ -961,7 +1028,6 @@ static void imu_task(void *arg)
         }
 
         if (!baseline_ready) {
-            // Collect samples for baseline
             calib_sum_ax += ax_g;
             calib_sum_ay += ay_g;
             calib_sum_az += az_g;
@@ -975,14 +1041,12 @@ static void imu_task(void *arg)
                 baseline_acc_g = sqrtf(avg_ax*avg_ax + avg_ay*avg_ay + avg_az*avg_az);
                 if (baseline_acc_g < 1e-6f) baseline_acc_g = 1e-6f;
 
-                // gravity unit vector (down direction)
                 g_unit_x = avg_ax / baseline_acc_g;
                 g_unit_y = avg_ay / baseline_acc_g;
                 g_unit_z = avg_az / baseline_acc_g;
 
-                // Baseline pitch angle (for imbalance)
                 baseline_angle_deg = compute_angle_deg(avg_ax, avg_ay, avg_az);
-                last_angle_deg     = baseline_angle_deg;  // start here
+                last_angle_deg     = baseline_angle_deg;
 
                 baseline_ready = true;
                 ESP_LOGI(TAG,
@@ -991,16 +1055,13 @@ static void imu_task(void *arg)
             }
 
         } else {
-            // Vertical acceleration along gravity
             float proj   = ax_g * g_unit_x + ay_g * g_unit_y + az_g * g_unit_z;
-            float a_vert = proj - baseline_acc_g;   // dynamic vertical accel
+            float a_vert = proj - baseline_acc_g;
 
-            // Update last angle for imbalance
             last_angle_deg = compute_angle_deg(ax_g, ay_g, az_g);
 
             rep_update_from_vertical(a_vert);
 
-            // Debug every ~10 samples
             dbg_counter++;
             if (dbg_counter >= 10) {
                 dbg_counter = 0;
@@ -1010,7 +1071,6 @@ static void imu_task(void *arg)
             }
         }
 
-        // Update UI every ~10 samples
         ui_counter++;
         if (ui_counter >= 10) {
             ui_counter = 0;
@@ -1021,10 +1081,10 @@ static void imu_task(void *arg)
     }
 }
 
-// ----------------------------------------------------
-// Button task (polling + debounce)
-// ----------------------------------------------------
 
+
+
+// button stuff:
 static void button_init(void)
 {
     gpio_config_t io_conf = {
@@ -1047,9 +1107,8 @@ static void button_task(void *arg)
     while (1) {
         int level = gpio_get_level(BUTTON_GPIO);
 
-        // Detect falling edge (HIGH -> LOW)
         if (last_level == 1 && level == 0) {
-            vTaskDelay(pdMS_TO_TICKS(30)); // debounce
+            vTaskDelay(pdMS_TO_TICKS(30));
             if (gpio_get_level(BUTTON_GPIO) == 0) {
                 if (!session_running) {
                     start_session();
@@ -1064,15 +1123,11 @@ static void button_task(void *arg)
     }
 }
 
-// ----------------------------------------------------
-// app_main
-// ----------------------------------------------------
 
 void app_main(void)
 {
     esp_err_t ret;
 
-    // -------------------- NVS init (needed for Wi-Fi etc.) --------------------
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1081,17 +1136,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // -------------------- Display + LVGL --------------------
     disp = gui_setup();
 
     lvgl_port_lock(0);
     create_main_screen();
     lvgl_port_unlock();
 
-    // Initial status on screen
     update_labels_idle("INIT I2C/IMU...");
 
-    // -------------------- I2C --------------------
     ret = i2c_master_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
@@ -1099,7 +1151,6 @@ void app_main(void)
         return;
     }
 
-    // -------------------- IMU --------------------
     ret = imu_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "IMU init failed: %s", esp_err_to_name(ret));
@@ -1107,18 +1158,13 @@ void app_main(void)
         return;
     }
 
-    // -------------------- Button + tasks --------------------
     button_init();
 
-    // IMU sampling / rep detection
     xTaskCreate(imu_task,    "imu_task",    4096, NULL, 5, NULL);
-
-    // Physical button: START/STOP. Stack bumped to 4096 to avoid overflow.
-    xTaskCreate(button_task, "button_task", 4096, NULL, 6, NULL);
+    xTaskCreate(button_task, "button_task", 8192, NULL, 6, NULL);
 
     ESP_LOGI(TAG, "RepSense ready – press the button to START/STOP");
 
-    // -------------------- Wi-Fi: connect to DukeOpen (non-fatal) --------------------
     ret = wifi_connect_dukeopen();
     if (ret != ESP_OK) {
         ESP_LOGW("WiFi",
@@ -1127,7 +1173,72 @@ void app_main(void)
                  WIFI_SSID);
     } else {
         ESP_LOGI("WiFi", "Wi-Fi connected to %s, OpenAI ready", WIFI_SSID);
+        
+        ESP_LOGI(TAG, "Initializing SNTP for time sync...");
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_setservername(1, "time.google.com");
+        esp_sntp_setservername(2, "time.nist.gov");
+        esp_sntp_init();
+        
+        time_t now = 0;
+        struct tm timeinfo = {0};
+        int retry = 0;
+        const int retry_count = 4; // 14 seconds
+        
+        while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+            ESP_LOGI(TAG, "Waiting for SNTP sync... (%d/%d)", retry, retry_count);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        
+        // I was getting some certificate errors, so I am pulling up
+        // the system time manually if SNTP sync fails.
+        if (timeinfo.tm_year < (2020 - 1900)) {
+            ESP_LOGW(TAG, "SNTP sync failed (year=%d) - setting time manually to 2025-12-04",
+                     timeinfo.tm_year + 1900);
+            
+            struct tm manual_time = {
+                .tm_year = 2025 - 1900,
+                .tm_mon = 12 - 1,
+                .tm_mday = 4,
+                .tm_hour = 12,
+                .tm_min = 0,
+                .tm_sec = 0
+            };
+            time_t t = mktime(&manual_time);
+            struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            ESP_LOGI(TAG, "Time manually set to: %04d-%02d-%02d %02d:%02d:%02d",
+                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        } else {
+            char strftime_buf[64];
+            strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+            ESP_LOGI(TAG, "System time synchronized via SNTP: %s", strftime_buf);
+        }
     }
 
-    // Nothing else to do in app_main; tasks run in the background.
+    g_openai_mutex = xSemaphoreCreateMutex();
+    if (!g_openai_mutex) {
+        ESP_LOGW("OpenAI", "Failed to create mutex; OpenAI requests may be skipped");
+    }
+
+    BaseType_t ok = xTaskCreate(
+        openai_task,
+        "openai_task",
+        8192,
+        NULL,
+        4,
+        &g_openai_task_handle
+    );
+    if (ok != pdPASS) {
+        ESP_LOGW("OpenAI", "Failed to create openai_task");
+        g_openai_task_handle = NULL;
+    }
 }
