@@ -1,6 +1,10 @@
 // RepSense
 // Adeildo Vieira (av259)
 
+// Quality of Life includes for ESP-IDF
+// OpenAI integration improvements
+// Tests run and verified 12/13/2025 10:00 PM
+
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
