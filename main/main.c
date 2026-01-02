@@ -458,6 +458,9 @@ static lv_disp_t *disp         = NULL;
 static lv_obj_t  *label_status = NULL;
 static lv_obj_t  *label_time   = NULL;
 static lv_obj_t  *label_reps   = NULL;
+static lv_style_t style_title;
+static lv_style_t style_body;
+static lv_style_t style_value;
 
 static esp_err_t i2c_master_init(void)
 {
@@ -505,6 +508,28 @@ static void i2c_scan(void)
         }
     }
     ESP_LOGI(TAG, "I2C scan done");
+}
+
+// ----------------------------------------------------
+// LVGL styles
+// ----------------------------------------------------
+
+static void init_ui_styles(void)
+{
+    lv_style_init(&style_title);
+    lv_style_set_text_color(&style_title, lv_color_hex(0x00b5ff));
+    lv_style_set_text_font(&style_title, LV_FONT_DEFAULT);
+    lv_style_set_text_align(&style_title, LV_TEXT_ALIGN_CENTER);
+
+    lv_style_init(&style_body);
+    lv_style_set_text_color(&style_body, lv_color_hex(0xf0f0f0));
+    lv_style_set_text_font(&style_body, LV_FONT_DEFAULT);
+    lv_style_set_text_align(&style_body, LV_TEXT_ALIGN_CENTER);
+
+    lv_style_init(&style_value);
+    lv_style_set_text_color(&style_value, lv_color_hex(0xffffff));
+    lv_style_set_text_font(&style_value, LV_FONT_DEFAULT);
+    lv_style_set_text_align(&style_value, LV_TEXT_ALIGN_CENTER);
 }
 
 static esp_err_t imu_write_reg(uint8_t reg, uint8_t data)
@@ -640,7 +665,7 @@ static lv_disp_t *gui_setup(void)
     gpio_set_level(EXAMPLE_PIN_NUM_BK_LIGHT, EXAMPLE_LCD_BK_LIGHT_ON_LEVEL);
 
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    lvgl_port_init(&lvgl_cfg);
+    ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
 
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io_handle,
@@ -653,7 +678,14 @@ static lv_disp_t *gui_setup(void)
         .flags = {.swap_bytes = true},
         .rotation = {.swap_xy = false, .mirror_x = true, .mirror_y = true}
     };
-    return lvgl_port_add_disp(&disp_cfg);
+    lv_disp_t *d = lvgl_port_add_disp(&disp_cfg);
+    if (!d) {
+        ESP_LOGE(TAG, "Failed to create LVGL display instance");
+        return NULL;
+    }
+
+    lv_disp_set_default(d);
+    return d;
 }
 
 static void update_labels_idle(const char *reason)
@@ -723,15 +755,32 @@ static void create_main_screen(void)
 {
     lv_obj_t *scr = lv_scr_act();
 
-    label_status = lv_label_create(scr);
-    lv_obj_align(label_status, LV_ALIGN_TOP_MID, 0, 10);
-    lv_label_set_long_mode(label_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(label_status, 220);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(scr, 10, 0);
 
-    label_time = lv_label_create(scr);
+    lv_obj_t *card = lv_obj_create(scr);
+    lv_obj_set_size(card, EXAMPLE_LCD_H_RES - 12, EXAMPLE_LCD_V_RES - 12);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x0f2435), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x1f3b57), 0);
+
+    label_status = lv_label_create(card);
+    lv_label_set_long_mode(label_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label_status, EXAMPLE_LCD_H_RES - 32);
+    lv_obj_add_style(label_status, &style_title, 0);
+    lv_obj_align(label_status, LV_ALIGN_TOP_MID, 0, 0);
+
+    label_time = lv_label_create(card);
+    lv_obj_add_style(label_time, &style_body, 0);
     lv_obj_align(label_time, LV_ALIGN_TOP_MID, 0, 70);
 
-    label_reps = lv_label_create(scr);
+    label_reps = lv_label_create(card);
+    lv_obj_add_style(label_reps, &style_value, 0);
     lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 110);
 
     update_labels_idle("READY");
@@ -1156,8 +1205,13 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     disp = gui_setup();
+    if (!disp) {
+        ESP_LOGE(TAG, "Display init failed; halting app");
+        return;
+    }
 
     lvgl_port_lock(0);
+    init_ui_styles();
     create_main_screen();
     lvgl_port_unlock();
 
