@@ -1,9 +1,15 @@
-// RepSense
+// RepSense - version 2026.01.02.2
 // Adeildo Vieira (av259)
 
 // Quality of Life includes for ESP-IDF
 // OpenAI integration improvements
 // Tests run and verified 12/13/2025 10:00 PM
+
+// Project overview (plain English): This app turns an ESP32-S3-BOX into a gym rep assistant.
+// It reads an IMU to count reps and measure bar tilt, shows live status on the LCD, and when
+// Wi‑Fi is available it sends a short workout summary to OpenAI for quick feedback. Press the
+// front button to start/stop a session; the screen shows time, reps, and imbalance. If Wi‑Fi
+// or time sync fails, it keeps working locally and just skips the AI call.
 
 #include <stdio.h>
 #include <string.h>
