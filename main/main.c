@@ -292,11 +292,11 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
     ui_set_footer("Wi-Fi: connected | AI: requesting...");
     
-    time_t now = time(NULL);
-    struct tm *timeinfo = localtime(&now);
+    time(&now);
+    localtime_r(&now, &timeinfo);
     ESP_LOGI(TAG_OPENAI, "System time: %04d-%02d-%02d %02d:%02d:%02d",
-             timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
     // HTTP client config for Chat Completions
     esp_http_client_config_t cfg = {
@@ -345,6 +345,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     if (err != ESP_OK) {
         ESP_LOGE(TAG_OPENAI, "HTTP perform error: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        ui_set_footer("Wi-Fi: connected | AI: error");
         return err;
     }
 
