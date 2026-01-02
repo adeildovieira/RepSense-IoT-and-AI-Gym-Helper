@@ -274,8 +274,17 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         return ESP_ERR_INVALID_STATE;
     }
 
+    time_t now = time(NULL);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_year + 1900 < 2020) {
+        ESP_LOGW(TAG_OPENAI, "System time not set; skipping OpenAI request");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
     ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
+    ui_set_footer("Wi-Fi: connected | AI: requesting...");
     
     time_t now = time(NULL);
     struct tm *timeinfo = localtime(&now);
@@ -290,11 +299,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         .method                   = HTTP_METHOD_POST,
         .event_handler            = _http_event_handler,
         .transport_type           = HTTP_TRANSPORT_OVER_SSL,
-
-        // For DukeOpen network - disable strict SSL for now
-        .skip_cert_common_name_check = true,
         .crt_bundle_attach        = esp_crt_bundle_attach,
-        
         .timeout_ms               = 20000,
         .buffer_size              = 4096,
         .disable_auto_redirect    = true,
@@ -326,9 +331,6 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     ESP_LOGI(TAG_OPENAI, "Authorization header set (key length: %d)", (int)strlen(OPENAI_API_KEY));
 
     int body_len = strlen(json_body);
-    char content_length_str[32];
-    snprintf(content_length_str, sizeof(content_length_str), "%d", body_len);
-    esp_http_client_set_header(client, "Content-Length", content_length_str);
     esp_http_client_set_post_field(client, json_body, body_len);
     
     ESP_LOGI(TAG_OPENAI, "Sending OpenAI request...");
@@ -377,23 +379,18 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     if (status / 100 != 2) {
         ESP_LOGW(TAG_OPENAI, "========== HTTP ERROR ==========");
         ESP_LOGW(TAG_OPENAI, "Status Code: %d", status);
-        
-        if (status >= 300 && status < 400) {
-            char location_buf[256];
-            if (esp_http_client_get_header(client, "Location", (char **)&location_buf) == ESP_OK) {
-                ESP_LOGW(TAG_OPENAI, "Redirect to: %s", location_buf);
-            }
-        }
-        
         ESP_LOGW(TAG_OPENAI, "Response: %s", total_read > 0 ? body : "(empty)");
         ESP_LOGW(TAG_OPENAI, "================================");
         esp_http_client_cleanup(client);
+        ui_set_footer("Wi-Fi: connected | AI: error");
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG_OPENAI, "========== SUCCESS RESPONSE ==========");
     ESP_LOGI(TAG_OPENAI, "Response: %s", body);
     ESP_LOGI(TAG_OPENAI, "======================================");
+
+    ui_set_footer("Wi-Fi: connected | AI: ok");
 
     esp_http_client_cleanup(client);
     return ESP_OK;
@@ -458,6 +455,7 @@ static lv_disp_t *disp         = NULL;
 static lv_obj_t  *label_status = NULL;
 static lv_obj_t  *label_time   = NULL;
 static lv_obj_t  *label_reps   = NULL;
+static lv_obj_t  *label_footer = NULL;
 static lv_style_t style_title;
 static lv_style_t style_body;
 static lv_style_t style_value;
@@ -530,6 +528,18 @@ static void init_ui_styles(void)
     lv_style_set_text_color(&style_value, lv_color_hex(0xffffff));
     lv_style_set_text_font(&style_value, LV_FONT_DEFAULT);
     lv_style_set_text_align(&style_value, LV_TEXT_ALIGN_CENTER);
+}
+
+// ----------------------------------------------------
+// UI helpers
+// ----------------------------------------------------
+
+static void ui_set_footer(const char *text)
+{
+    if (!label_footer) return;
+    lvgl_port_lock(0);
+    lv_label_set_text(label_footer, text ? text : "");
+    lvgl_port_unlock();
 }
 
 static esp_err_t imu_write_reg(uint8_t reg, uint8_t data)
@@ -783,7 +793,14 @@ static void create_main_screen(void)
     lv_obj_add_style(label_reps, &style_value, 0);
     lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 110);
 
+    label_footer = lv_label_create(card);
+    lv_obj_add_style(label_footer, &style_body, 0);
+    lv_label_set_long_mode(label_footer, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label_footer, EXAMPLE_LCD_H_RES - 32);
+    lv_obj_align(label_footer, LV_ALIGN_BOTTOM_MID, 0, -6);
+
     update_labels_idle("READY");
+    ui_set_footer("Wi-Fi: unknown | AI: idle");
 }
 
 typedef struct {
@@ -1244,8 +1261,10 @@ void app_main(void)
                  "Could not connect to SSID:%s. "
                  "Continuing without Wi-Fi; OpenAI calls will be skipped.",
                  WIFI_SSID);
+        ui_set_footer("Wi-Fi: offline | AI: disabled");
     } else {
         ESP_LOGI("WiFi", "Wi-Fi connected to %s, OpenAI ready", WIFI_SSID);
+        ui_set_footer("Wi-Fi: connected | Time: syncing...");
         
         ESP_LOGI(TAG, "Initializing SNTP for time sync...");
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -1257,9 +1276,9 @@ void app_main(void)
         time_t now = 0;
         struct tm timeinfo = {0};
         int retry = 0;
-        const int retry_count = 4; // 14 seconds
+        const int retry_count = 5; // ~10 seconds
         
-        while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry <= retry_count) {
             ESP_LOGI(TAG, "Waiting for SNTP sync... (%d/%d)", retry, retry_count);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
@@ -1267,8 +1286,6 @@ void app_main(void)
         time(&now);
         localtime_r(&now, &timeinfo);
         
-        // I was getting some certificate errors, so I am pulling up
-        // the system time manually if SNTP sync fails.
         if (timeinfo.tm_year < (2020 - 1900)) {
             ESP_LOGW(TAG, "SNTP sync failed (year=%d) - setting time manually to 2025-12-04",
                      timeinfo.tm_year + 1900);
@@ -1290,10 +1307,12 @@ void app_main(void)
             ESP_LOGI(TAG, "Time manually set to: %04d-%02d-%02d %02d:%02d:%02d",
                      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            ui_set_footer("Wi-Fi: connected | Time: manual set");
         } else {
             char strftime_buf[64];
             strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
             ESP_LOGI(TAG, "System time synchronized via SNTP: %s", strftime_buf);
+            ui_set_footer("Wi-Fi: connected | Time: synced");
         }
     }
 
