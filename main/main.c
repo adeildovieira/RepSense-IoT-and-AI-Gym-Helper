@@ -105,6 +105,9 @@ static bool              g_openai_body_valid = false;
 
 #define CALIB_SAMPLES              100   //using ~1 s of calibration at 100 Hz
 
+// Optional debug (scans I2C bus at boot). Set to 1 only when debugging wiring.
+#define ENABLE_I2C_SCAN            0
+
 // Acceleration (VERTICAL) for bench press mov.
 #define VERT_SIGN_DEADZONE_G       0.02f   // tiny noise being ignored
 #define VERT_MOTION_THRESH_G       0.02f   // starting rep if our |a_vert| >= this one
@@ -245,10 +248,8 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
                  evt->header_value ? evt->header_value : "(null)");
         break;
     case HTTP_EVENT_ON_DATA:
-        ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_DATA, len=%d data=%.*s",
-                 evt->data_len, 
-                 evt->data_len > 100 ? 100 : evt->data_len,
-                 (char *)evt->data);
+        // Verbose log disabled to save CPU/flash; uncomment for debugging payloads
+        // ESP_LOGV(TAG_OPENAI, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
         break;
     case HTTP_EVENT_ON_FINISH:
         ESP_LOGI(TAG_OPENAI, "HTTP_EVENT_ON_FINISH");
@@ -569,7 +570,9 @@ static esp_err_t imu_read_bytes(uint8_t reg, uint8_t *data, size_t len)
 
 static esp_err_t imu_init(void)
 {
-    i2c_scan();
+    if (ENABLE_I2C_SCAN) {
+        i2c_scan();
+    }
 
     esp_err_t ret;
     uint8_t who = 0;
