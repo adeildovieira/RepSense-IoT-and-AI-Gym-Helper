@@ -108,6 +108,9 @@ static bool              g_openai_body_valid = false;
 // Optional debug (scans I2C bus at boot). Set to 1 only when debugging wiring.
 #define ENABLE_I2C_SCAN            0
 
+// Simple low-pass filter for accel (0..1). Higher = follow new data more, lower = smoother.
+#define ACC_LPF_ALPHA              0.2f
+
 // Acceleration (VERTICAL) for bench press mov.
 #define VERT_SIGN_DEADZONE_G       0.02f   // tiny noise being ignored
 #define VERT_MOTION_THRESH_G       0.02f   // starting rep if our |a_vert| >= this one
@@ -1090,6 +1093,11 @@ static void imu_task(void *arg)
     float calib_sum_ay  = 0.0f;
     float calib_sum_az  = 0.0f;
 
+    // Low-pass filtered accel (initialized lazily on first sample after start)
+    float filt_ax = 0.0f;
+    float filt_ay = 0.0f;
+    float filt_az = 0.0f;
+
     bool  prev_running  = false;
     int   ui_counter    = 0;
     int   dbg_counter   = 0;
@@ -1122,10 +1130,21 @@ static void imu_task(void *arg)
             continue;
         }
 
+        // Low-pass filter to smooth noise and reduce false rep triggers
+        if (calib_count == 0 && !baseline_ready && !prev_running) {
+            filt_ax = ax_g;
+            filt_ay = ay_g;
+            filt_az = az_g;
+        } else {
+            filt_ax = ACC_LPF_ALPHA * ax_g + (1.0f - ACC_LPF_ALPHA) * filt_ax;
+            filt_ay = ACC_LPF_ALPHA * ay_g + (1.0f - ACC_LPF_ALPHA) * filt_ay;
+            filt_az = ACC_LPF_ALPHA * az_g + (1.0f - ACC_LPF_ALPHA) * filt_az;
+        }
+
         if (!baseline_ready) {
-            calib_sum_ax += ax_g;
-            calib_sum_ay += ay_g;
-            calib_sum_az += az_g;
+            calib_sum_ax += filt_ax;
+            calib_sum_ay += filt_ay;
+            calib_sum_az += filt_az;
             calib_count++;
 
             if (calib_count >= CALIB_SAMPLES) {
@@ -1150,10 +1169,10 @@ static void imu_task(void *arg)
             }
 
         } else {
-            float proj   = ax_g * g_unit_x + ay_g * g_unit_y + az_g * g_unit_z;
+            float proj   = filt_ax * g_unit_x + filt_ay * g_unit_y + filt_az * g_unit_z;
             float a_vert = proj - baseline_acc_g;
 
-            last_angle_deg = compute_angle_deg(ax_g, ay_g, az_g);
+            last_angle_deg = compute_angle_deg(filt_ax, filt_ay, filt_az);
 
             rep_update_from_vertical(a_vert);
 
