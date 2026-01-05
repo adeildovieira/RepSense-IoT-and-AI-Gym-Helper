@@ -460,6 +460,11 @@ static int   last_sign         = 0;
 
 static float rep_peak_abs_vert = 0.0f;
 
+// Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
+static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
+static float g_motion_thresh_g     = VERT_MOTION_THRESH_G;
+static float g_return_thresh_g     = VERT_RETURN_THRESH_G;
+
 static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
 
 static lv_disp_t *disp         = NULL;
@@ -1092,6 +1097,9 @@ static void imu_task(void *arg)
     float calib_sum_ax  = 0.0f;
     float calib_sum_ay  = 0.0f;
     float calib_sum_az  = 0.0f;
+    float calib_sum_sq_ax = 0.0f;
+    float calib_sum_sq_ay = 0.0f;
+    float calib_sum_sq_az = 0.0f;
 
     // Low-pass filtered accel (initialized lazily on first sample after start)
     float filt_ax = 0.0f;
@@ -1145,6 +1153,9 @@ static void imu_task(void *arg)
             calib_sum_ax += filt_ax;
             calib_sum_ay += filt_ay;
             calib_sum_az += filt_az;
+            calib_sum_sq_ax += filt_ax * filt_ax;
+            calib_sum_sq_ay += filt_ay * filt_ay;
+            calib_sum_sq_az += filt_az * filt_az;
             calib_count++;
 
             if (calib_count >= CALIB_SAMPLES) {
@@ -1161,6 +1172,19 @@ static void imu_task(void *arg)
 
                 baseline_angle_deg = compute_angle_deg(avg_ax, avg_ay, avg_az);
                 last_angle_deg     = baseline_angle_deg;
+
+                // Estimate noise (RMS per-axis) to adapt thresholds
+                float var_ax = fmaxf(0.0f, (calib_sum_sq_ax / (float)calib_count) - avg_ax * avg_ax);
+                float var_ay = fmaxf(0.0f, (calib_sum_sq_ay / (float)calib_count) - avg_ay * avg_ay);
+                float var_az = fmaxf(0.0f, (calib_sum_sq_az / (float)calib_count) - avg_az * avg_az);
+                float noise_rms = sqrtf((var_ax + var_ay + var_az) / 3.0f);
+
+                g_deadzone_thresh_g = fmaxf(VERT_SIGN_DEADZONE_G, noise_rms * 2.0f);
+                g_motion_thresh_g   = fmaxf(VERT_MOTION_THRESH_G, noise_rms * 3.5f);
+                g_return_thresh_g   = fmaxf(VERT_RETURN_THRESH_G, noise_rms * 2.5f);
+
+                ESP_LOGI(TAG, "Adaptive thresholds: deadzone=%.4f g, motion=%.4f g, return=%.4f g (noise_rms=%.4f g)",
+                         g_deadzone_thresh_g, g_motion_thresh_g, g_return_thresh_g, noise_rms);
 
                 baseline_ready = true;
                 ESP_LOGI(TAG,
