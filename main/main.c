@@ -102,6 +102,7 @@ static bool              g_openai_body_valid = false;
 
 #define SAMPLE_RATE_HZ             100
 #define SAMPLE_PERIOD_MS           (1000 / SAMPLE_RATE_HZ)
+#define SAMPLE_PERIOD_S            (1.0f / (float)SAMPLE_RATE_HZ)
 
 #define CALIB_SAMPLES              100   //using ~1 s of calibration at 100 Hz
 
@@ -124,6 +125,9 @@ static bool              g_openai_body_valid = false;
 // Baseline (gravity vector) slow adaptation when device is quiet
 #define BASELINE_ADAPT_ALPHA       0.005f   // very slow exponential update
 #define BASELINE_ADAPT_QUIET_SAMPLES 50     // number of quiet samples (~0.5s at 100Hz)
+
+// Peak jerk (rate of change of vertical accel) requirement based on noise
+#define JERK_SIGMA_MULT            4.0f     // multiple of noise sigma used for jerk threshold
 
 
 // WiFi configuration (same as Lab 4)
@@ -466,6 +470,11 @@ static int   direction_changes = 0;
 static int   last_sign         = 0;
 
 static float rep_peak_abs_vert = 0.0f;
+static float rep_peak_abs_jerk = 0.0f;   // peak |jerk| observed during a rep (g/s)
+
+// previous vertical accel to compute jerk
+static float g_prev_a_vert = 0.0f;
+static bool  g_prev_a_vert_valid = false;
 
 // Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
@@ -1035,7 +1044,7 @@ static void stop_session(void)
     update_labels_done(seconds, imbalance_deg);
 }
 
-static void rep_update_from_vertical(float a_vert)
+static void rep_update_from_vertical(float a_vert, float jerk_gps)
 {
     if (!baseline_ready || !session_running) return;
 
@@ -1058,12 +1067,18 @@ static void rep_update_from_vertical(float a_vert)
             direction_changes  = 0;
             last_sign          = sign;
             rep_peak_abs_vert  = abs_vert;   // start tracking peak
+            rep_peak_abs_jerk  = fabsf(jerk_gps);
             ESP_LOGI(TAG, "Rep motion started (a_vert=%.3f g)", a_vert);
         }
     } else {
         // While in motion, update peak vertical accel
         if (abs_vert > rep_peak_abs_vert) {
             rep_peak_abs_vert = abs_vert;
+        }
+        // track peak jerk while in motion
+        float abs_jerk = fabsf(jerk_gps);
+        if (abs_jerk > rep_peak_abs_jerk) {
+            rep_peak_abs_jerk = abs_jerk;
         }
 
         if (sign != 0 && last_sign != 0 && sign != last_sign) {
@@ -1074,25 +1089,30 @@ static void rep_update_from_vertical(float a_vert)
         }
 
         if (direction_changes >= 2 && abs_vert <= g_return_thresh_g) {
-                if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
+            // noise-aware jerk threshold: k * noise_rms / dt
+            float jerk_min = (g_noise_rms > 0.0f) ? (JERK_SIGMA_MULT * g_noise_rms / SAMPLE_PERIOD_S) : 0.0f;
+
+            if (rep_peak_abs_vert >= VERT_PEAK_MIN_G && rep_peak_abs_jerk >= jerk_min) {
                     int64_t now_us = esp_timer_get_time();
                     if (now_us - g_last_rep_time_us >= (int64_t)MIN_REP_INTERVAL_MS * 1000LL) {
                         rep_count++;
                         g_last_rep_time_us = now_us;
-                        ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
+                    ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g, peak |jerk|=%.1f g/s, thr=%.1f)",
+                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min);
                     } else {
                         ESP_LOGD(TAG, "Ignored rep (too close to previous): dt_us=%lld", (long long)(now_us - g_last_rep_time_us));
                     }
                 } else {
                 ESP_LOGI(TAG,
-                         "Motion ended but peak |a_vert|=%.3f g < %.3f g (not counting)",
-                         rep_peak_abs_vert, VERT_PEAK_MIN_G);
+                         "Motion ended but peak |a_vert|=%.3f g < %.3f g or peak |jerk|=%.1f < %.1f (not counting)",
+                         rep_peak_abs_vert, VERT_PEAK_MIN_G, rep_peak_abs_jerk, jerk_min);
             }
 
             rep_in_motion      = false;
             direction_changes  = 0;
             last_sign          = 0;
             rep_peak_abs_vert  = 0.0f;
+            rep_peak_abs_jerk  = 0.0f;
         }
     }
 }
@@ -1263,14 +1283,24 @@ static void imu_task(void *arg)
                 quiet_count = 0;
             }
 
-            rep_update_from_vertical(a_vert);
+            // Compute jerk (g/s) using fixed sample period
+            float jerk_gps = 0.0f;
+            if (g_prev_a_vert_valid) {
+                jerk_gps = (a_vert - g_prev_a_vert) / SAMPLE_PERIOD_S;
+            } else {
+                g_prev_a_vert_valid = true;
+            }
+            g_prev_a_vert = a_vert;
+
+            rep_update_from_vertical(a_vert, jerk_gps);
 
             dbg_counter++;
             if (dbg_counter >= 10) {
                 dbg_counter = 0;
-                ESP_LOGI(TAG,
-                        "a_vert=%.3f g, angle=%.2f deg, reps=%d, running=%d",
-                        a_vert, last_angle_deg, rep_count, session_running ? 1 : 0);
+        ESP_LOGI(TAG,
+            "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg, reps=%d, running=%d",
+            a_vert, (g_prev_a_vert_valid ? (a_vert - g_prev_a_vert) / SAMPLE_PERIOD_S : 0.0f),
+            last_angle_deg, rep_count, session_running ? 1 : 0);
             }
         }
 
