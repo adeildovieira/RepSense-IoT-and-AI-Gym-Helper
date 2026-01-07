@@ -118,6 +118,13 @@ static bool              g_openai_body_valid = false;
 
 #define VERT_PEAK_MIN_G            0.075f   // it requires >= 0.075 g at some point in the rep
 
+// Minimum time between counted reps to avoid double-counting (ms)
+#define MIN_REP_INTERVAL_MS        300
+
+// Baseline (gravity vector) slow adaptation when device is quiet
+#define BASELINE_ADAPT_ALPHA       0.005f   // very slow exponential update
+#define BASELINE_ADAPT_QUIET_SAMPLES 50     // number of quiet samples (~0.5s at 100Hz)
+
 
 // WiFi configuration (same as Lab 4)
 
@@ -464,6 +471,11 @@ static float rep_peak_abs_vert = 0.0f;
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
 static float g_motion_thresh_g     = VERT_MOTION_THRESH_G;
 static float g_return_thresh_g     = VERT_RETURN_THRESH_G;
+// Calibration-measured noise RMS (per-axis combined). Used to inform derivative / hysteresis.
+static float g_noise_rms = 0.02f;
+
+// Last counted rep time (microseconds) to enforce MIN_REP_INTERVAL_MS
+static int64_t g_last_rep_time_us = 0;
 
 static uint8_t g_imu_addr = IMU_ADDR_DEFAULT;
 
@@ -1031,9 +1043,9 @@ static void rep_update_from_vertical(float a_vert)
 
     // Determine sign with deadzone
     int sign;
-    if (a_vert > VERT_SIGN_DEADZONE_G) {
+    if (a_vert > g_deadzone_thresh_g) {
         sign = 1;
-    } else if (a_vert < -VERT_SIGN_DEADZONE_G) {
+    } else if (a_vert < -g_deadzone_thresh_g) {
         sign = -1;
     } else {
         sign = 0;
@@ -1041,7 +1053,7 @@ static void rep_update_from_vertical(float a_vert)
 
     if (!rep_in_motion) {
         // Start of motion: |a_vert| big enough
-        if (abs_vert >= VERT_MOTION_THRESH_G) {
+        if (abs_vert >= g_motion_thresh_g) {
             rep_in_motion      = true;
             direction_changes  = 0;
             last_sign          = sign;
@@ -1061,7 +1073,7 @@ static void rep_update_from_vertical(float a_vert)
             last_sign = sign;
         }
 
-        if (direction_changes >= 2 && abs_vert <= VERT_RETURN_THRESH_G) {
+        if (direction_changes >= 2 && abs_vert <= g_return_thresh_g) {
             if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
                 rep_count++;
                 ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
@@ -1109,6 +1121,7 @@ static void imu_task(void *arg)
     bool  prev_running  = false;
     int   ui_counter    = 0;
     int   dbg_counter   = 0;
+    int   quiet_count   = 0; // counts consecutive quiet samples for baseline adaptation
 
     while (1) {
         if (!session_running) {
@@ -1179,6 +1192,10 @@ static void imu_task(void *arg)
                 float var_az = fmaxf(0.0f, (calib_sum_sq_az / (float)calib_count) - avg_az * avg_az);
                 float noise_rms = sqrtf((var_ax + var_ay + var_az) / 3.0f);
 
+                // store noise RMS for other heuristics
+                g_noise_rms = noise_rms;
+
+                // set adaptive thresholds but enforce sensible minimums
                 g_deadzone_thresh_g = fmaxf(VERT_SIGN_DEADZONE_G, noise_rms * 2.0f);
                 g_motion_thresh_g   = fmaxf(VERT_MOTION_THRESH_G, noise_rms * 3.5f);
                 g_return_thresh_g   = fmaxf(VERT_RETURN_THRESH_G, noise_rms * 2.5f);
@@ -1193,10 +1210,52 @@ static void imu_task(void *arg)
             }
 
         } else {
+
             float proj   = filt_ax * g_unit_x + filt_ay * g_unit_y + filt_az * g_unit_z;
             float a_vert = proj - baseline_acc_g;
 
             last_angle_deg = compute_angle_deg(filt_ax, filt_ay, filt_az);
+
+            // Baseline adaptation: if device is quiet (a_vert within deadzone) for
+            // some time, slowly adapt the gravity vector and magnitude. This helps
+            // handle slow drift or slight mounting shifts between sets.
+            if (!rep_in_motion) {
+                if (fabsf(a_vert) <= g_deadzone_thresh_g) {
+                    quiet_count++;
+                    if (quiet_count >= BASELINE_ADAPT_QUIET_SAMPLES) {
+                        float curr_mag = sqrtf(filt_ax*filt_ax + filt_ay*filt_ay + filt_az*filt_az);
+                        if (curr_mag > 1e-6f) {
+                            float curr_ux = filt_ax / curr_mag;
+                            float curr_uy = filt_ay / curr_mag;
+                            float curr_uz = filt_az / curr_mag;
+
+                            // EMA update
+                            baseline_acc_g = (1.0f - BASELINE_ADAPT_ALPHA) * baseline_acc_g + BASELINE_ADAPT_ALPHA * curr_mag;
+                            g_unit_x = (1.0f - BASELINE_ADAPT_ALPHA) * g_unit_x + BASELINE_ADAPT_ALPHA * curr_ux;
+                            g_unit_y = (1.0f - BASELINE_ADAPT_ALPHA) * g_unit_y + BASELINE_ADAPT_ALPHA * curr_uy;
+                            g_unit_z = (1.0f - BASELINE_ADAPT_ALPHA) * g_unit_z + BASELINE_ADAPT_ALPHA * curr_uz;
+
+                            // renormalize unit vector
+                            float gu_mag = sqrtf(g_unit_x*g_unit_x + g_unit_y*g_unit_y + g_unit_z*g_unit_z);
+                            if (gu_mag > 1e-6f) {
+                                g_unit_x /= gu_mag;
+                                g_unit_y /= gu_mag;
+                                g_unit_z /= gu_mag;
+                            }
+
+                            // keep quiet_count at half so adaptation continues slowly rather than every loop
+                            quiet_count = BASELINE_ADAPT_QUIET_SAMPLES / 2;
+
+                            ESP_LOGV(TAG, "Baseline adapt: mag=%.4f, g_unit=(%.3f,%.3f,%.3f)",
+                                     baseline_acc_g, g_unit_x, g_unit_y, g_unit_z);
+                        }
+                    }
+                } else {
+                    quiet_count = 0;
+                }
+            } else {
+                quiet_count = 0;
+            }
 
             rep_update_from_vertical(a_vert);
 
