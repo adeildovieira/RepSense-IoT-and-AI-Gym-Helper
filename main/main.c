@@ -1074,10 +1074,16 @@ static void rep_update_from_vertical(float a_vert)
         }
 
         if (direction_changes >= 2 && abs_vert <= g_return_thresh_g) {
-            if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
-                rep_count++;
-                ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
-            } else {
+                if (rep_peak_abs_vert >= VERT_PEAK_MIN_G) {
+                    int64_t now_us = esp_timer_get_time();
+                    if (now_us - g_last_rep_time_us >= (int64_t)MIN_REP_INTERVAL_MS * 1000LL) {
+                        rep_count++;
+                        g_last_rep_time_us = now_us;
+                        ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g)", rep_count, rep_peak_abs_vert);
+                    } else {
+                        ESP_LOGD(TAG, "Ignored rep (too close to previous): dt_us=%lld", (long long)(now_us - g_last_rep_time_us));
+                    }
+                } else {
                 ESP_LOGI(TAG,
                          "Motion ended but peak |a_vert|=%.3f g < %.3f g (not counting)",
                          rep_peak_abs_vert, VERT_PEAK_MIN_G);
