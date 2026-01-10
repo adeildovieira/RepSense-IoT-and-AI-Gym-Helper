@@ -785,7 +785,7 @@ static void update_labels_running(void)
     lvgl_port_unlock();
 }
 
-static void update_labels_done(float total_time_s, float imbalance_deg)
+static void update_labels_done(float total_time_s, float imbalance_avg_deg, float imbalance_max_deg)
 {
     if (!label_status || !label_time || !label_reps) return;
 
@@ -793,8 +793,8 @@ static void update_labels_done(float total_time_s, float imbalance_deg)
     lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf),
-             "RepSense: DONE\nImbalance: %.1f deg\nPress button to START again",
-             imbalance_deg);
+             "RepSense: DONE\nImbalance: avg %.1f° (max %.1f°)\nPress button to START again",
+             imbalance_avg_deg, imbalance_max_deg);
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
@@ -1017,17 +1017,18 @@ static void stop_session(void)
     }
     float seconds = (float)dt_us / 1e6f;
 
-    // Prefer session-average of per-rep peak angle deviation as imbalance
+    // Prefer session-average and max of per-rep peak angle deviation as imbalance metrics
     float avg_peak_angle = (sess_peak_angle_count > 0)
                          ? (sess_sum_peak_angle_deg / (float)sess_peak_angle_count)
                          : fabsf(last_angle_deg - baseline_angle_deg);
-    float imbalance_deg = avg_peak_angle;
+    float max_peak_angle = sess_peak_angle_count > 0 ? sess_max_peak_angle_deg
+                                                    : fabsf(last_angle_deg - baseline_angle_deg);
 
     repsense_session_t sess = {
         .session_id     = ++g_session_counter,
         .total_time_s   = seconds,
         .reps           = rep_count,
-        .imbalance_deg  = imbalance_deg,
+        .imbalance_deg  = avg_peak_angle,
     };
 
     char toon_buf[256];
@@ -1058,7 +1059,7 @@ static void stop_session(void)
         ESP_LOGW("OpenAI", "OpenAI task not ready; skipping request");
     }
 
-    update_labels_done(seconds, imbalance_deg);
+    update_labels_done(seconds, avg_peak_angle, max_peak_angle);
 }
 
 static void rep_update_from_vertical(float a_vert, float jerk_gps)
