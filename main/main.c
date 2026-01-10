@@ -476,6 +476,12 @@ static float rep_peak_abs_jerk = 0.0f;   // peak |jerk| observed during a rep (g
 static float g_prev_a_vert = 0.0f;
 static bool  g_prev_a_vert_valid = false;
 
+// Imbalance tracking (angle deviation from baseline)
+static float rep_peak_abs_angle_deg   = 0.0f;  // peak abs(angle-baseline) during current rep
+static float sess_sum_peak_angle_deg  = 0.0f;  // sum across counted reps
+static float sess_max_peak_angle_deg  = 0.0f;  // session max
+static int   sess_peak_angle_count    = 0;     // number of counted reps contributing
+
 // Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
 static float g_motion_thresh_g     = VERT_MOTION_THRESH_G;
@@ -968,6 +974,9 @@ static void reset_rep_state(void)
     direction_changes = 0;
     last_sign         = 0;
 }
+    // Reset additional state variables
+    rep_peak_abs_vert = 0.0f;
+    rep_peak_abs_jerk = 0.0f;   // Reset peak jerk observed during a rep
 
 static void start_session(void)
 {
@@ -982,6 +991,10 @@ static void start_session(void)
     last_angle_deg     = 0.0f;
 
     reset_rep_state();
+    // reset imbalance accumulators
+    sess_sum_peak_angle_deg = 0.0f;
+    sess_max_peak_angle_deg = 0.0f;
+    sess_peak_angle_count   = 0;
 
     session_start_us = esp_timer_get_time();
     session_running  = true;
@@ -1004,7 +1017,11 @@ static void stop_session(void)
     }
     float seconds = (float)dt_us / 1e6f;
 
-    float imbalance_deg = fabsf(last_angle_deg - baseline_angle_deg);
+    // Prefer session-average of per-rep peak angle deviation as imbalance
+    float avg_peak_angle = (sess_peak_angle_count > 0)
+                         ? (sess_sum_peak_angle_deg / (float)sess_peak_angle_count)
+                         : fabsf(last_angle_deg - baseline_angle_deg);
+    float imbalance_deg = avg_peak_angle;
 
     repsense_session_t sess = {
         .session_id     = ++g_session_counter,
@@ -1097,8 +1114,15 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
                     if (now_us - g_last_rep_time_us >= (int64_t)MIN_REP_INTERVAL_MS * 1000LL) {
                         rep_count++;
                         g_last_rep_time_us = now_us;
-                    ESP_LOGI(TAG, "Rep %d (peak |a_vert|=%.3f g, peak |jerk|=%.1f g/s, thr=%.1f)",
-                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min);
+                    // Accumulate imbalance metrics
+                    sess_sum_peak_angle_deg += rep_peak_abs_angle_deg;
+                    sess_peak_angle_count++;
+                    if (rep_peak_abs_angle_deg > sess_max_peak_angle_deg) {
+                        sess_max_peak_angle_deg = rep_peak_abs_angle_deg;
+                    }
+
+                    ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg)",
+                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min, rep_peak_abs_angle_deg);
                     } else {
                         ESP_LOGD(TAG, "Ignored rep (too close to previous): dt_us=%lld", (long long)(now_us - g_last_rep_time_us));
                     }
@@ -1113,6 +1137,7 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
             last_sign          = 0;
             rep_peak_abs_vert  = 0.0f;
             rep_peak_abs_jerk  = 0.0f;
+            rep_peak_abs_angle_deg = 0.0f;
         }
     }
 }
@@ -1297,10 +1322,16 @@ static void imu_task(void *arg)
             dbg_counter++;
             if (dbg_counter >= 10) {
                 dbg_counter = 0;
+        // Track per-rep peak absolute angle deviation for imbalance
+        float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
+        if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
+            rep_peak_abs_angle_deg = angle_dev;
+        }
+
         ESP_LOGI(TAG,
-            "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg, reps=%d, running=%d",
+            "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg (dev=%.2f), reps=%d, running=%d",
             a_vert, (g_prev_a_vert_valid ? (a_vert - g_prev_a_vert) / SAMPLE_PERIOD_S : 0.0f),
-            last_angle_deg, rep_count, session_running ? 1 : 0);
+            last_angle_deg, angle_dev, rep_count, session_running ? 1 : 0);
             }
         }
 
