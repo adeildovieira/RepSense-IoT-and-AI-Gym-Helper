@@ -1172,7 +1172,7 @@ static void imu_task(void *arg)
 
     bool  prev_running  = false;
     int   ui_counter    = 0;
-    int   dbg_counter   = 0;
+    int   dbg_counter   = 0; // debug log throttle counter
     int   quiet_count   = 0; // counts consecutive quiet samples for baseline adaptation
 
     while (1) {
@@ -1321,18 +1321,18 @@ static void imu_task(void *arg)
             rep_update_from_vertical(a_vert, jerk_gps);
 
             dbg_counter++;
-            if (dbg_counter >= 10) {
+            if (dbg_counter >= 20) { // log every ~0.2 s instead of ~0.1 s
                 dbg_counter = 0;
-        // Track per-rep peak absolute angle deviation for imbalance
-        float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
-        if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
-            rep_peak_abs_angle_deg = angle_dev;
-        }
+                // Track per-rep peak absolute angle deviation for imbalance
+                float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
+                if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
+                    rep_peak_abs_angle_deg = angle_dev;
+                }
 
-        ESP_LOGI(TAG,
-            "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg (dev=%.2f), reps=%d, running=%d",
-            a_vert, (g_prev_a_vert_valid ? (a_vert - g_prev_a_vert) / SAMPLE_PERIOD_S : 0.0f),
-            last_angle_deg, angle_dev, rep_count, session_running ? 1 : 0);
+                ESP_LOGD(TAG,
+                        "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg (dev=%.2f), reps=%d, running=%d",
+                        a_vert, (g_prev_a_vert_valid ? (a_vert - g_prev_a_vert) / SAMPLE_PERIOD_S : 0.0f),
+                        last_angle_deg, angle_dev, rep_count, session_running ? 1 : 0);
             }
         }
 
