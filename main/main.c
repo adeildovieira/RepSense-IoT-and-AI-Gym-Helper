@@ -1368,13 +1368,26 @@ static void button_task(void *arg)
     ESP_LOGI(TAG, "Button task started on GPIO %d", BUTTON_GPIO);
 
     int last_level = gpio_get_level(BUTTON_GPIO);
+    int stable_count = 0;
+    const int required_stable = 3; // 3 * 10ms = 30ms stable low before trigger
+    int64_t last_trigger_us = 0;
 
     while (1) {
         int level = gpio_get_level(BUTTON_GPIO);
 
-        if (last_level == 1 && level == 0) {
-            vTaskDelay(pdMS_TO_TICKS(30));
-            if (gpio_get_level(BUTTON_GPIO) == 0) {
+        if (level == last_level) {
+            if (level == 0 && stable_count < required_stable) {
+                stable_count++;
+            }
+        } else {
+            stable_count = 0;
+        }
+
+        // trigger on stable falling edge with cooldown
+        if (last_level == 1 && level == 0 && stable_count >= required_stable) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_trigger_us >= 300000) { // 300 ms cooldown
+                last_trigger_us = now_us;
                 if (!session_running) {
                     start_session();
                 } else {
