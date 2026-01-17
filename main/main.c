@@ -852,7 +852,8 @@ typedef struct {
     uint32_t session_id;
     float    total_time_s;
     int      reps;
-    float    imbalance_deg;
+    float    imbalance_deg;      // average per-rep peak angle deviation
+    float    imbalance_max_deg;  // max per-rep peak angle deviation
 } repsense_session_t;
 
 static uint32_t g_session_counter = 0;
@@ -870,11 +871,13 @@ static void build_session_toon(const repsense_session_t *s,
              "session_id: %lu\n"
              "time_s: %.2f\n"
              "reps: %d\n"
-             "imbalance_deg: %.2f\n",
+             "imbalance_deg: %.2f\n"
+             "imbalance_max_deg: %.2f\n",
              (unsigned long)s->session_id,
              s->total_time_s,
              s->reps,
-             s->imbalance_deg);
+             s->imbalance_deg,
+             s->imbalance_max_deg);
 }
 
 static void json_escape_string(const char *in, char *out, size_t out_size)
@@ -1025,10 +1028,11 @@ static void stop_session(void)
                                                     : fabsf(last_angle_deg - baseline_angle_deg);
 
     repsense_session_t sess = {
-        .session_id     = ++g_session_counter,
-        .total_time_s   = seconds,
-        .reps           = rep_count,
-        .imbalance_deg  = avg_peak_angle,
+        .session_id        = ++g_session_counter,
+        .total_time_s      = seconds,
+        .reps              = rep_count,
+        .imbalance_deg     = avg_peak_angle,
+        .imbalance_max_deg = max_peak_angle,
     };
 
     char toon_buf[256];
@@ -1038,8 +1042,8 @@ static void stop_session(void)
     build_openai_chat_body(toon_buf, openai_body, sizeof(openai_body));
 
     ESP_LOGI(TAG,
-             "Session STOP: time = %.2f s, reps = %d, imbalance = %.2f deg",
-             seconds, rep_count, imbalance_deg);
+             "Session STOP: time = %.2f s, reps = %d, imbalance avg = %.2f deg, max = %.2f deg",
+             seconds, rep_count, avg_peak_angle, max_peak_angle);
     ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
     ESP_LOGI(TAG, "OpenAI Chat body:\n%s", openai_body);
 
