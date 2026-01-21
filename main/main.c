@@ -976,10 +976,13 @@ static void reset_rep_state(void)
     rep_in_motion    = false;
     direction_changes = 0;
     last_sign         = 0;
-}
-    // Reset additional state variables
     rep_peak_abs_vert = 0.0f;
-    rep_peak_abs_jerk = 0.0f;   // Reset peak jerk observed during a rep
+    rep_peak_abs_jerk = 0.0f;   // peak jerk observed during a rep
+    rep_peak_abs_angle_deg = 0.0f;
+    g_prev_a_vert = 0.0f;
+    g_prev_a_vert_valid = false;
+    g_last_rep_time_us = 0;
+}
 
 static void start_session(void)
 {
