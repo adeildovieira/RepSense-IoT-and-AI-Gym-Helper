@@ -1,4 +1,4 @@
-// RepSense - version 2026.01.16.3
+// RepSense - version 2026.01.20.5
 // Adeildo Vieira (av259)
 
 // Quality of Life includes for ESP-IDF
@@ -878,12 +878,18 @@ static void build_session_toon(const repsense_session_t *s,
              "time_s: %.2f\n"
              "reps: %d\n"
              "imbalance_deg: %.2f\n"
-             "imbalance_max_deg: %.2f\n",
+             "imbalance_max_deg: %.2f\n"
+             "cadence_rpm: %.2f\n"
+             "jerk_avg_gps: %.2f\n"
+             "jerk_max_gps: %.2f\n",
              (unsigned long)s->session_id,
              s->total_time_s,
              s->reps,
              s->imbalance_deg,
-             s->imbalance_max_deg);
+             s->imbalance_max_deg,
+             s->cadence_rpm,
+             s->jerk_avg_gps,
+             s->jerk_max_gps);
 }
 
 static void json_escape_string(const char *in, char *out, size_t out_size)
@@ -951,7 +957,8 @@ static void build_openai_chat_body(const char *toon,
     "Each Toon includes: session_id, time_s, reps, imbalance_deg (average per-rep peak tilt), and imbalance_max_deg (max per-rep peak tilt). "
     "DO NOT HALLUCINATE or invent data. DO NOT ask questions. "
     "Only give short, concrete feedback based on these fields. "
-    "1) Briefly assess the set (fatigue, pace, stability). "
+    "Also provided: cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (peak jerk per rep, avg and max). "
+    "1) Briefly assess pace/stability using cadence and jerk (e.g., too jerky, smooth, too slow/fast). "
     "2) Comment on imbalance: mention average (imbalance_deg) and if imbalance_max_deg is notably higher, flag the worst-case tilt. "
     "3) Suggest ONE short, practical tip for the next set. "
         "Keep your response to 3 bullet points, max.";
@@ -988,6 +995,9 @@ static void reset_rep_state(void)
     g_prev_a_vert = 0.0f;
     g_prev_a_vert_valid = false;
     g_last_rep_time_us = 0;
+
+    sess_sum_peak_jerk_gps = 0.0f;
+    sess_max_peak_jerk_gps = 0.0f;
 }
 
 static void start_session(void)
@@ -1007,6 +1017,8 @@ static void start_session(void)
     sess_sum_peak_angle_deg = 0.0f;
     sess_max_peak_angle_deg = 0.0f;
     sess_peak_angle_count   = 0;
+    sess_sum_peak_jerk_gps  = 0.0f;
+    sess_max_peak_jerk_gps  = 0.0f;
 
     session_start_us = esp_timer_get_time();
     session_running  = true;
@@ -1036,12 +1048,24 @@ static void stop_session(void)
     float max_peak_angle = sess_peak_angle_count > 0 ? sess_max_peak_angle_deg
                                                     : fabsf(last_angle_deg - baseline_angle_deg);
 
+    // Jerk stats (average of peak jerk per rep, and max)
+    float avg_peak_jerk = (sess_peak_angle_count > 0)
+                        ? (sess_sum_peak_jerk_gps / (float)sess_peak_angle_count)
+                        : 0.0f;
+    float max_peak_jerk = sess_max_peak_jerk_gps;
+
+    // Cadence (reps per minute)
+    float cadence_rpm = (seconds > 0.0f) ? ((float)rep_count / seconds) * 60.0f : 0.0f;
+
     repsense_session_t sess = {
         .session_id        = ++g_session_counter,
         .total_time_s      = seconds,
         .reps              = rep_count,
         .imbalance_deg     = avg_peak_angle,
         .imbalance_max_deg = max_peak_angle,
+        .cadence_rpm       = cadence_rpm,
+        .jerk_avg_gps      = avg_peak_jerk,
+        .jerk_max_gps      = max_peak_jerk,
     };
 
     char toon_buf[256];
@@ -1051,8 +1075,8 @@ static void stop_session(void)
     build_openai_chat_body(toon_buf, openai_body, sizeof(openai_body));
 
     ESP_LOGI(TAG,
-             "Session STOP: time = %.2f s, reps = %d, imbalance avg = %.2f deg, max = %.2f deg",
-             seconds, rep_count, avg_peak_angle, max_peak_angle);
+             "Session STOP: time = %.2f s, reps = %d, cadence=%.1f rpm, jerk avg/max=%.1f/%.1f g/s, imbalance avg/max=%.2f/%.2f deg",
+             seconds, rep_count, cadence_rpm, avg_peak_jerk, max_peak_jerk, avg_peak_angle, max_peak_angle);
     ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
     ESP_LOGI(TAG, "OpenAI Chat body:\n%s", openai_body);
 
@@ -1134,6 +1158,12 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
                     sess_peak_angle_count++;
                     if (rep_peak_abs_angle_deg > sess_max_peak_angle_deg) {
                         sess_max_peak_angle_deg = rep_peak_abs_angle_deg;
+                    }
+
+                    // Accumulate jerk metrics
+                    sess_sum_peak_jerk_gps += rep_peak_abs_jerk;
+                    if (rep_peak_abs_jerk > sess_max_peak_jerk_gps) {
+                        sess_max_peak_jerk_gps = rep_peak_abs_jerk;
                     }
 
                     ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg)",
