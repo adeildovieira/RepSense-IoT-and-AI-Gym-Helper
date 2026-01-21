@@ -482,6 +482,9 @@ static float sess_sum_peak_angle_deg  = 0.0f;  // sum across counted reps
 static float sess_max_peak_angle_deg  = 0.0f;  // session max
 static int   sess_peak_angle_count    = 0;     // number of counted reps contributing
 
+static float sess_sum_peak_jerk_gps   = 0.0f;  // sum of peak jerk per rep
+static float sess_max_peak_jerk_gps   = 0.0f;  // max peak jerk
+
 // Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
 static float g_motion_thresh_g     = VERT_MOTION_THRESH_G;
@@ -854,6 +857,9 @@ typedef struct {
     int      reps;
     float    imbalance_deg;      // average per-rep peak angle deviation
     float    imbalance_max_deg;  // max per-rep peak angle deviation
+    float    cadence_rpm;        // reps per minute
+    float    jerk_avg_gps;       // average peak jerk per rep
+    float    jerk_max_gps;       // max peak jerk across reps
 } repsense_session_t;
 
 static uint32_t g_session_counter = 0;
