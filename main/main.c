@@ -1093,6 +1093,7 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
             last_sign          = sign;
             rep_peak_abs_vert  = abs_vert;   // start tracking peak
             rep_peak_abs_jerk  = fabsf(jerk_gps);
+            rep_peak_abs_angle_deg = fabsf(last_angle_deg - baseline_angle_deg);
             ESP_LOGI(TAG, "Rep motion started (a_vert=%.3f g)", a_vert);
         }
     } else {
