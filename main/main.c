@@ -942,12 +942,12 @@ static void build_openai_chat_body(const char *toon,
     const char *system_prompt =
         "You are RepSense, an AI gym coach. "
         "The user will send you workout sets in a custom text format called 'RepSenseToon v1'. "
-        "Each Toon includes: session_id, time_s, reps, and imbalance_deg. "
-        "DO NOT HALLUCINATE or invent data. DO NOT ask questions. "
-        "Only give short, concrete feedback based on these fields. "
-        "1) Briefly assess the set (fatigue, pace, stability). "
-        "2) Comment on imbalance_deg in simple terms (left/right balance). "
-        "3) Suggest ONE short, practical tip for the next set. "
+    "Each Toon includes: session_id, time_s, reps, imbalance_deg (average per-rep peak tilt), and imbalance_max_deg (max per-rep peak tilt). "
+    "DO NOT HALLUCINATE or invent data. DO NOT ask questions. "
+    "Only give short, concrete feedback based on these fields. "
+    "1) Briefly assess the set (fatigue, pace, stability). "
+    "2) Comment on imbalance: mention average (imbalance_deg) and if imbalance_max_deg is notably higher, flag the worst-case tilt. "
+    "3) Suggest ONE short, practical tip for the next set. "
         "Keep your response to 3 bullet points, max.";
 
     char escaped_system[512];
@@ -1325,16 +1325,17 @@ static void imu_task(void *arg)
             }
             g_prev_a_vert = a_vert;
 
+            // Track per-rep peak absolute angle deviation continuously
+            float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
+            if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
+                rep_peak_abs_angle_deg = angle_dev;
+            }
+
             rep_update_from_vertical(a_vert, jerk_gps);
 
             dbg_counter++;
             if (dbg_counter >= 20) { // log every ~0.2 s instead of ~0.1 s
                 dbg_counter = 0;
-                // Track per-rep peak absolute angle deviation for imbalance
-                float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
-                if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
-                    rep_peak_abs_angle_deg = angle_dev;
-                }
 
                 ESP_LOGD(TAG,
                         "a_vert=%.3f g, jerk=%.1f g/s, angle=%.2f deg (dev=%.2f), reps=%d, running=%d",
