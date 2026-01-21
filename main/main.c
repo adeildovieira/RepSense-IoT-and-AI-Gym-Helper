@@ -295,13 +295,8 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         return ESP_ERR_INVALID_STATE;
     }
 
-    time_t now = time(NULL);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
-    if (timeinfo.tm_year + 1900 < 2020) {
-        ESP_LOGW(TAG_OPENAI, "System time not set; skipping OpenAI request");
-        return ESP_ERR_INVALID_STATE;
-    }
+    // Previously we skipped the request if time was not set. We now proceed regardless,
+    // assuming the most recently synced time is acceptable.
 
     ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
     ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
