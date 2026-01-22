@@ -947,13 +947,12 @@ static void build_openai_chat_body(const char *toon,
     }
 
     const char *system_prompt =
-        "You are RepSense, an AI gym coach. "
-        "Input format: 'RepSenseToon v1' with fields session_id, time_s, reps, imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (max per-rep peak tilt), cadence_rpm (reps/min), jerk_avg_gps, jerk_max_gps (peak jerk per rep avg/max). "
-        "Rules: do NOT hallucinate or invent data; do NOT ask questions. Use only provided fields. Be concise. "
-        "Respond as exactly 3 bullet points: "
-        "1) Pace/stability from cadence and jerk (e.g., smooth vs jerky, too slow/fast). "
-        "2) Imbalance: report average tilt (imbalance_deg) and call out worst-case if imbalance_max_deg is higher. "
-        "3) One short, practical tip for next set.";
+        "You are RepSense, an on-device strength coach. "
+        "Input: 'RepSenseToon v1' with fields session_id, time_s (session duration), reps (count), cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (smoother when lower), imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (worst per-rep peak tilt). "
+        "Rules: no questions, no invented data, use only these numbers. If reps == 0 or time_s < 5, say data too short to judge and give one quick setup tip. Otherwise respond as exactly 3 short bullet points (<=18 words each): "
+        "1) Pace + stability using cadence_rpm and jerk values (smooth/jerky, slow/ok/fast). "
+        "2) Imbalance with average tilt and clear worst-case callout if imbalance_max_deg exceeds imbalance_deg. "
+        "3) One actionable cue for next set (grip, tempo, bracing).";
 
     char escaped_system[512];
     json_escape_string(system_prompt, escaped_system, sizeof(escaped_system));
