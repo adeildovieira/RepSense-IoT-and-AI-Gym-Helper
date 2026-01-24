@@ -129,6 +129,10 @@ static bool              g_openai_body_valid = false;
 #define BASELINE_ADAPT_ALPHA       0.005f   // very slow exponential update
 #define BASELINE_ADAPT_QUIET_SAMPLES 50     // number of quiet samples (~0.5s at 100Hz)
 
+// Imbalance guidance thresholds
+#define IMBAL_GOAL_DEG             3.0f     // target to stay within for good form
+#define IMBAL_WARN_DEG             6.0f     // warn user to re-level if above this
+
 // Peak jerk (rate of change of vertical accel) requirement based on noise
 #define JERK_SIGMA_MULT            4.0f     // multiple of noise sigma used for jerk threshold
 
@@ -460,6 +464,8 @@ static float          g_unit_z             = 0.0f;
 
 static float baseline_angle_deg = 0.0f;
 static float last_angle_deg     = 0.0f;
+static volatile float g_live_angle_dev_deg = 0.0f;
+static volatile float g_live_peak_angle_dev_deg = 0.0f;
 
 static int   rep_count     = 0;
 
@@ -499,6 +505,7 @@ static lv_disp_t *disp         = NULL;
 static lv_obj_t  *label_status = NULL;
 static lv_obj_t  *label_time   = NULL;
 static lv_obj_t  *label_reps   = NULL;
+static lv_obj_t  *label_imbalance = NULL;
 static lv_obj_t  *label_footer = NULL;
 static lv_style_t style_title;
 static lv_style_t style_body;
@@ -758,6 +765,11 @@ static void update_labels_idle(const char *reason)
     lv_label_set_text(label_time, "Time: 0.0 s");
     lv_label_set_text(label_reps, "Reps: 0");
 
+    if (label_imbalance) {
+        snprintf(buf, sizeof(buf), "Tilt: -- • goal ≤%.1f°", IMBAL_GOAL_DEG);
+        lv_label_set_text(label_imbalance, buf);
+    }
+
     lvgl_port_unlock();
 }
 
@@ -783,6 +795,23 @@ static void update_labels_running(void)
     snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
     lv_label_set_text(label_reps, buf);
 
+    if (label_imbalance) {
+        float angle_now = g_live_angle_dev_deg;
+        float peak_now  = g_live_peak_angle_dev_deg;
+        const char *cue;
+        if (peak_now <= IMBAL_GOAL_DEG) {
+            cue = "level";
+        } else if (peak_now <= IMBAL_WARN_DEG) {
+            cue = "steady wrists";
+        } else {
+            cue = "fix tilt now";
+        }
+        snprintf(buf, sizeof(buf),
+                 "Tilt now %.1f° • peak %.1f° • goal ≤%.1f° (%s)",
+                 angle_now, peak_now, IMBAL_GOAL_DEG, cue);
+        lv_label_set_text(label_imbalance, buf);
+    }
+
     lvgl_port_unlock();
 }
 
@@ -803,6 +832,11 @@ static void update_labels_done(float total_time_s, float imbalance_avg_deg, floa
 
     snprintf(buf, sizeof(buf), "Reps: %d", rep_count);
     lv_label_set_text(label_reps, buf);
+
+    if (label_imbalance) {
+        snprintf(buf, sizeof(buf), "Next set goal: keep tilt ≤%.1f°", IMBAL_GOAL_DEG);
+        lv_label_set_text(label_imbalance, buf);
+    }
 
     lvgl_port_unlock();
 }
@@ -838,6 +872,12 @@ static void create_main_screen(void)
     label_reps = lv_label_create(card);
     lv_obj_add_style(label_reps, &style_value, 0);
     lv_obj_align(label_reps, LV_ALIGN_TOP_MID, 0, 110);
+
+    label_imbalance = lv_label_create(card);
+    lv_obj_add_style(label_imbalance, &style_body, 0);
+    lv_label_set_long_mode(label_imbalance, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label_imbalance, EXAMPLE_LCD_H_RES - 32);
+    lv_obj_align(label_imbalance, LV_ALIGN_TOP_MID, 0, 150);
 
     label_footer = lv_label_create(card);
     lv_obj_add_style(label_footer, &style_body, 0);
@@ -996,6 +1036,9 @@ static void reset_rep_state(void)
 
     sess_sum_peak_jerk_gps = 0.0f;
     sess_max_peak_jerk_gps = 0.0f;
+
+    g_live_angle_dev_deg = 0.0f;
+    g_live_peak_angle_dev_deg = 0.0f;
 }
 
 static void start_session(void)
@@ -1362,8 +1405,16 @@ static void imu_task(void *arg)
 
             // Track per-rep peak absolute angle deviation continuously
             float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
+            g_live_angle_dev_deg = angle_dev;
             if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
                 rep_peak_abs_angle_deg = angle_dev;
+            }
+            if (rep_in_motion) {
+                if (angle_dev > g_live_peak_angle_dev_deg) {
+                    g_live_peak_angle_dev_deg = angle_dev;
+                }
+            } else {
+                g_live_peak_angle_dev_deg = angle_dev;
             }
 
             rep_update_from_vertical(a_vert, jerk_gps);
