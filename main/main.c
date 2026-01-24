@@ -1224,6 +1224,7 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
             rep_peak_abs_vert  = 0.0f;
             rep_peak_abs_jerk  = 0.0f;
             rep_peak_abs_angle_deg = 0.0f;
+            g_live_peak_angle_dev_deg = g_live_angle_dev_deg;
         }
     }
 }
