@@ -63,6 +63,9 @@
 static const char *TAG = "RepSense";
 static const char *TAG_OPENAI = "OpenAI";
 
+#define REPSENSE_FW_VERSION "2026.01.20.5"
+#define REPSENSE_EXERCISE   "bench_press_barbell"
+
 // OpenAI connections:
 #define OPENAI_BODY_MAX_LEN 2048
 
@@ -869,6 +872,8 @@ static void build_session_toon(const repsense_session_t *s,
 
     snprintf(out, out_size,
              "RepSenseToon v1\n"
+             "fw_version: %s\n"
+             "exercise: %s\n"
              "session_id: %lu\n"
              "time_s: %.2f\n"
              "reps: %d\n"
@@ -877,6 +882,8 @@ static void build_session_toon(const repsense_session_t *s,
              "cadence_rpm: %.2f\n"
              "jerk_avg_gps: %.2f\n"
              "jerk_max_gps: %.2f\n",
+             REPSENSE_FW_VERSION,
+             REPSENSE_EXERCISE,
              (unsigned long)s->session_id,
              s->total_time_s,
              s->reps,
@@ -948,7 +955,7 @@ static void build_openai_chat_body(const char *toon,
 
     const char *system_prompt =
         "You are RepSense, an on-device strength coach. "
-        "Input: 'RepSenseToon v1' with fields session_id, time_s (session duration), reps (count), cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (smoother when lower), imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (worst per-rep peak tilt). "
+        "Input: 'RepSenseToon v1' with fields session_id, fw_version, exercise, time_s (session duration), reps (count), cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (smoother when lower), imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (worst per-rep peak tilt). "
         "Rules: no questions, no invented data, use only these numbers. If reps == 0 or time_s < 5, say data too short to judge and give one quick setup tip. Otherwise respond as exactly 3 short bullet points (<=18 words each): "
         "1) Pace + stability using cadence_rpm and jerk values (smooth/jerky, slow/ok/fast). "
         "2) Imbalance with average tilt and clear worst-case callout if imbalance_max_deg exceeds imbalance_deg. "
