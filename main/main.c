@@ -303,7 +303,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
 
     ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
     ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
-    ui_set_footer("Wi-Fi: connected | AI: requesting...");
+    ui_set_footer("Wi-Fi on • AI requesting");
     
     time(&now);
     localtime_r(&now, &timeinfo);
@@ -358,7 +358,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     if (err != ESP_OK) {
         ESP_LOGE(TAG_OPENAI, "HTTP perform error: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        ui_set_footer("Wi-Fi: connected | AI: error");
+    ui_set_footer("Wi-Fi on • AI error");
         return err;
     }
 
@@ -402,7 +402,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
         ESP_LOGW(TAG_OPENAI, "Response: %s", total_read > 0 ? body : "(empty)");
         ESP_LOGW(TAG_OPENAI, "================================");
         esp_http_client_cleanup(client);
-        ui_set_footer("Wi-Fi: connected | AI: error");
+    ui_set_footer("Wi-Fi on • AI error");
         return ESP_FAIL;
     }
 
@@ -410,7 +410,7 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     ESP_LOGI(TAG_OPENAI, "Response: %s", body);
     ESP_LOGI(TAG_OPENAI, "======================================");
 
-    ui_set_footer("Wi-Fi: connected | AI: ok");
+    ui_set_footer("Wi-Fi on • AI ready");
 
     esp_http_client_cleanup(client);
     return ESP_OK;
@@ -752,7 +752,7 @@ static void update_labels_idle(const char *reason)
     lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf),
-             "RepSense: %s\nPress button to START", reason ? reason : "IDLE");
+             "RepSense • %s\nPress button to start", reason ? reason : "Idle");
     lv_label_set_text(label_status, buf);
 
     lv_label_set_text(label_time, "Time: 0.0 s");
@@ -774,7 +774,7 @@ static void update_labels_running(void)
     lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf),
-             "RepSense: RUNNING\n(press button to STOP)");
+             "Running • press button to stop");
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", seconds);
@@ -794,7 +794,7 @@ static void update_labels_done(float total_time_s, float imbalance_avg_deg, floa
     lvgl_port_lock(0);
 
     snprintf(buf, sizeof(buf),
-             "RepSense: DONE\nImbalance: avg %.1f° (max %.1f°)\nPress button to START again",
+             "Set done • Imbalance avg %.1f° (max %.1f°)\nPress button to start new set",
              imbalance_avg_deg, imbalance_max_deg);
     lv_label_set_text(label_status, buf);
 
@@ -845,8 +845,8 @@ static void create_main_screen(void)
     lv_obj_set_width(label_footer, EXAMPLE_LCD_H_RES - 32);
     lv_obj_align(label_footer, LV_ALIGN_BOTTOM_MID, 0, -6);
 
-    update_labels_idle("READY");
-    ui_set_footer("Wi-Fi: unknown | AI: idle");
+    update_labels_idle("Ready");
+    ui_set_footer("Wi-Fi ? • AI idle");
 }
 
 typedef struct {
@@ -1497,10 +1497,10 @@ void app_main(void)
                  "Could not connect to SSID:%s. "
                  "Continuing without Wi-Fi; OpenAI calls will be skipped.",
                  WIFI_SSID);
-        ui_set_footer("Wi-Fi: offline | AI: disabled");
+    ui_set_footer("Wi-Fi off • AI disabled");
     } else {
         ESP_LOGI("WiFi", "Wi-Fi connected to %s, OpenAI ready", WIFI_SSID);
-        ui_set_footer("Wi-Fi: connected | Time: syncing...");
+    ui_set_footer("Wi-Fi on • Time syncing");
         
         ESP_LOGI(TAG, "Initializing SNTP for time sync...");
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -1543,12 +1543,12 @@ void app_main(void)
             ESP_LOGI(TAG, "Time manually set to: %04d-%02d-%02d %02d:%02d:%02d",
                      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-            ui_set_footer("Wi-Fi: connected | Time: manual set");
+            ui_set_footer("Wi-Fi on • Time set (manual)");
         } else {
             char strftime_buf[64];
             strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
             ESP_LOGI(TAG, "System time synchronized via SNTP: %s", strftime_buf);
-            ui_set_footer("Wi-Fi: connected | Time: synced");
+            ui_set_footer("Wi-Fi on • Time synced");
         }
     }
 
