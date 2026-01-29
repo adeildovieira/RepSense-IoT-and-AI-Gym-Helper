@@ -133,9 +133,11 @@ static bool              g_openai_body_valid = false;
 #define IMBAL_GOAL_DEG             3.0f     // target to stay within for good form
 #define IMBAL_WARN_DEG             6.0f     // warn user to re-level if above this
 
-// Direction labels for signed tilt (adjust if mounting orientation differs)
-#define IMBAL_DIR_POS_LABEL        "tilt up"
-#define IMBAL_DIR_NEG_LABEL        "tilt down"
+// Direction labels for signed tilt (set for your mounting)
+// For bench press: if positive angle means left side drops, label pos as "left low"
+// and neg as "right low". Swap if your mounting is reversed.
+#define IMBAL_DIR_POS_LABEL        "left low"
+#define IMBAL_DIR_NEG_LABEL        "right low"
 
 // Peak jerk (rate of change of vertical accel) requirement based on noise
 #define JERK_SIGMA_MULT            4.0f     // multiple of noise sigma used for jerk threshold
