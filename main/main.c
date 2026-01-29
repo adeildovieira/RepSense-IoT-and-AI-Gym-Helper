@@ -133,6 +133,10 @@ static bool              g_openai_body_valid = false;
 #define IMBAL_GOAL_DEG             3.0f     // target to stay within for good form
 #define IMBAL_WARN_DEG             6.0f     // warn user to re-level if above this
 
+// Direction labels for signed tilt (adjust if mounting orientation differs)
+#define IMBAL_DIR_POS_LABEL        "tilt up"
+#define IMBAL_DIR_NEG_LABEL        "tilt down"
+
 // Peak jerk (rate of change of vertical accel) requirement based on noise
 #define JERK_SIGMA_MULT            4.0f     // multiple of noise sigma used for jerk threshold
 
@@ -804,25 +808,28 @@ static void update_labels_running(void)
         float peak_now   = g_live_peak_angle_dev_deg;
         const char *dir;
         if (angle_diff > 0.4f) {
-            dir = "tilt up";
+            dir = IMBAL_DIR_POS_LABEL;
         } else if (angle_diff < -0.4f) {
-            dir = "tilt down";
+            dir = IMBAL_DIR_NEG_LABEL;
         } else {
             dir = "level";
         }
 
         const char *cue;
+        const char *flag = "";
         if (peak_now <= IMBAL_GOAL_DEG) {
-            cue = "good level";
+            cue  = "good level";
         } else if (peak_now <= IMBAL_WARN_DEG) {
-            cue = "steady wrists";
+            cue  = "steady wrists";
+            flag = " • warning";
         } else {
-            cue = "re-level now";
+            cue  = "re-level now";
+            flag = " • ALERT";
         }
 
         snprintf(buf, sizeof(buf),
-                 "Tilt %.1f° (%s) • peak %.1f° • goal ≤%.1f° • %s",
-                 angle_diff, dir, peak_now, IMBAL_GOAL_DEG, cue);
+                 "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
+                 angle_diff, dir, flag, peak_now, IMBAL_GOAL_DEG, cue);
         lv_label_set_text(label_imbalance, buf);
     }
 
