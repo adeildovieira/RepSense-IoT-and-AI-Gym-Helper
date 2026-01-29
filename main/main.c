@@ -464,6 +464,9 @@ static float          g_unit_z             = 0.0f;
 
 static float baseline_angle_deg = 0.0f;
 static float last_angle_deg     = 0.0f;
+static volatile float g_live_angle_diff_deg = 0.0f;      // signed tilt vs baseline
+static volatile float g_live_angle_dev_deg  = 0.0f;      // abs tilt vs baseline (live)
+static volatile float g_live_peak_angle_dev_deg = 0.0f;  // peak abs tilt in current/last rep
 static volatile float g_live_angle_dev_deg = 0.0f;
 static volatile float g_live_peak_angle_dev_deg = 0.0f;
 
@@ -796,19 +799,30 @@ static void update_labels_running(void)
     lv_label_set_text(label_reps, buf);
 
     if (label_imbalance) {
-        float angle_now = g_live_angle_dev_deg;
-        float peak_now  = g_live_peak_angle_dev_deg;
+        float angle_now  = g_live_angle_dev_deg;
+        float angle_diff = g_live_angle_diff_deg;
+        float peak_now   = g_live_peak_angle_dev_deg;
+        const char *dir;
+        if (angle_diff > 0.4f) {
+            dir = "tilt up";
+        } else if (angle_diff < -0.4f) {
+            dir = "tilt down";
+        } else {
+            dir = "level";
+        }
+
         const char *cue;
         if (peak_now <= IMBAL_GOAL_DEG) {
-            cue = "level";
+            cue = "good level";
         } else if (peak_now <= IMBAL_WARN_DEG) {
             cue = "steady wrists";
         } else {
-            cue = "fix tilt now";
+            cue = "re-level now";
         }
+
         snprintf(buf, sizeof(buf),
-                 "Tilt now %.1f° • peak %.1f° • goal ≤%.1f° (%s)",
-                 angle_now, peak_now, IMBAL_GOAL_DEG, cue);
+                 "Tilt %.1f° (%s) • peak %.1f° • goal ≤%.1f° • %s",
+                 angle_diff, dir, peak_now, IMBAL_GOAL_DEG, cue);
         lv_label_set_text(label_imbalance, buf);
     }
 
@@ -1037,6 +1051,7 @@ static void reset_rep_state(void)
     sess_sum_peak_jerk_gps = 0.0f;
     sess_max_peak_jerk_gps = 0.0f;
 
+    g_live_angle_diff_deg = 0.0f;
     g_live_angle_dev_deg = 0.0f;
     g_live_peak_angle_dev_deg = 0.0f;
 }
@@ -1405,8 +1420,10 @@ static void imu_task(void *arg)
             g_prev_a_vert = a_vert;
 
             // Track per-rep peak absolute angle deviation continuously
-            float angle_dev = fabsf(last_angle_deg - baseline_angle_deg);
-            g_live_angle_dev_deg = angle_dev;
+            float angle_diff = last_angle_deg - baseline_angle_deg; // signed
+            float angle_dev  = fabsf(angle_diff);
+            g_live_angle_diff_deg = angle_diff;
+            g_live_angle_dev_deg  = angle_dev;
             if (rep_in_motion && angle_dev > rep_peak_abs_angle_deg) {
                 rep_peak_abs_angle_deg = angle_dev;
             }
