@@ -520,6 +520,7 @@ static lv_obj_t  *label_footer = NULL;
 static lv_style_t style_title;
 static lv_style_t style_body;
 static lv_style_t style_value;
+static lv_style_t style_alert;
 
 static esp_err_t i2c_master_init(void)
 {
@@ -589,6 +590,11 @@ static void init_ui_styles(void)
     lv_style_set_text_color(&style_value, lv_color_hex(0xffffff));
     lv_style_set_text_font(&style_value, LV_FONT_DEFAULT);
     lv_style_set_text_align(&style_value, LV_TEXT_ALIGN_CENTER);
+
+    lv_style_init(&style_alert);
+    lv_style_set_text_color(&style_alert, lv_color_hex(0xff4d4f));
+    lv_style_set_text_font(&style_alert, LV_FONT_DEFAULT);
+    lv_style_set_text_align(&style_alert, LV_TEXT_ALIGN_CENTER);
 }
 
 // ----------------------------------------------------
