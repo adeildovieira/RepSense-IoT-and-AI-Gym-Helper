@@ -473,6 +473,7 @@ static float last_angle_deg     = 0.0f;
 static volatile float g_live_angle_diff_deg = 0.0f;      // signed tilt vs baseline
 static volatile float g_live_angle_dev_deg  = 0.0f;      // abs tilt vs baseline (live)
 static volatile float g_live_peak_angle_dev_deg = 0.0f;  // peak abs tilt in current/last rep
+static int g_dir_state = 0; // -1 neg tilt, 0 level, +1 pos tilt (with hysteresis)
 static volatile float g_live_angle_dev_deg = 0.0f;
 static volatile float g_live_peak_angle_dev_deg = 0.0f;
 
@@ -808,10 +809,21 @@ static void update_labels_running(void)
         float angle_now  = g_live_angle_dev_deg;
         float angle_diff = g_live_angle_diff_deg;
         float peak_now   = g_live_peak_angle_dev_deg;
+        // Hysteresis to avoid flicker in direction label
+        const float DIR_HIGH = 0.5f;
+        const float DIR_LOW  = 0.25f;
+        if (g_dir_state >= 0 && angle_diff < -DIR_LOW) {
+            if (angle_diff < -DIR_HIGH) g_dir_state = -1;
+        } else if (g_dir_state <= 0 && angle_diff > DIR_LOW) {
+            if (angle_diff > DIR_HIGH) g_dir_state = 1;
+        } else if (fabsf(angle_diff) <= DIR_LOW) {
+            g_dir_state = 0;
+        }
+
         const char *dir;
-        if (angle_diff > 0.4f) {
+        if (g_dir_state > 0) {
             dir = IMBAL_DIR_POS_LABEL;
-        } else if (angle_diff < -0.4f) {
+        } else if (g_dir_state < 0) {
             dir = IMBAL_DIR_NEG_LABEL;
         } else {
             dir = "level";
@@ -1063,6 +1075,7 @@ static void reset_rep_state(void)
     g_live_angle_diff_deg = 0.0f;
     g_live_angle_dev_deg = 0.0f;
     g_live_peak_angle_dev_deg = 0.0f;
+    g_dir_state = 0;
 }
 
 static void start_session(void)
@@ -1224,6 +1237,7 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
                     if (rep_peak_abs_angle_deg > sess_max_peak_angle_deg) {
                         sess_max_peak_angle_deg = rep_peak_abs_angle_deg;
                     }
+                    g_live_peak_angle_dev_deg = rep_peak_abs_angle_deg;
 
                     // Accumulate jerk metrics
                     sess_sum_peak_jerk_gps += rep_peak_abs_jerk;
