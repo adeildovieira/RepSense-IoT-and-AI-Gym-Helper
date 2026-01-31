@@ -835,8 +835,9 @@ static void update_labels_running(void)
             dir = "level";
         }
 
-        const char *cue;
-        const char *flag = "";
+            const char *cue;
+            const char *flag = "";
+            bool alert = false;
         if (peak_now <= IMBAL_GOAL_DEG) {
             cue  = "good level";
         } else if (peak_now <= IMBAL_WARN_DEG) {
@@ -845,12 +846,17 @@ static void update_labels_running(void)
         } else {
             cue  = "re-level now";
             flag = " • ALERT";
+                alert = true;
         }
 
         snprintf(buf, sizeof(buf),
                  "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
                  angle_diff, dir, flag, peak_now, IMBAL_GOAL_DEG, cue);
         lv_label_set_text(label_imbalance, buf);
+
+        // Apply alert styling if needed
+        lv_obj_remove_style_all(label_imbalance);
+        lv_obj_add_style(label_imbalance, alert ? &style_alert : &style_body, 0);
     }
 
     lvgl_port_unlock();
@@ -862,10 +868,10 @@ static void update_labels_done(float total_time_s, float imbalance_avg_deg, floa
 
     char buf[160];
     lvgl_port_lock(0);
-
-    snprintf(buf, sizeof(buf),
-             "Set done • Imbalance avg %.1f° (max %.1f°)\nPress button to start new set",
-             imbalance_avg_deg, imbalance_max_deg);
+                snprintf(buf, sizeof(buf),
+                         "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
+                         angle_diff, dir, flag, peak_now, IMBAL_GOAL_DEG, cue);
+                lv_label_set_text(label_imbalance, buf);
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
