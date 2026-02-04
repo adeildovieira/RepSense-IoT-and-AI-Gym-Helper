@@ -521,6 +521,7 @@ static lv_style_t style_title;
 static lv_style_t style_body;
 static lv_style_t style_value;
 static lv_style_t style_alert;
+static lv_style_t style_warn;
 
 static esp_err_t i2c_master_init(void)
 {
@@ -590,6 +591,11 @@ static void init_ui_styles(void)
     lv_style_set_text_color(&style_value, lv_color_hex(0xffffff));
     lv_style_set_text_font(&style_value, LV_FONT_DEFAULT);
     lv_style_set_text_align(&style_value, LV_TEXT_ALIGN_CENTER);
+
+    lv_style_init(&style_warn);
+    lv_style_set_text_color(&style_warn, lv_color_hex(0xffc53d));
+    lv_style_set_text_font(&style_warn, LV_FONT_DEFAULT);
+    lv_style_set_text_align(&style_warn, LV_TEXT_ALIGN_CENTER);
 
     lv_style_init(&style_alert);
     lv_style_set_text_color(&style_alert, lv_color_hex(0xff4d4f));
@@ -838,16 +844,18 @@ static void update_labels_running(void)
             const char *cue;
             const char *flag = "";
             bool alert = false;
-        if (peak_now <= IMBAL_GOAL_DEG) {
-            cue  = "good level";
-        } else if (peak_now <= IMBAL_WARN_DEG) {
-            cue  = "steady wrists";
-            flag = " • warning";
-        } else {
-            cue  = "re-level now";
-            flag = " • ALERT";
+            bool warn  = false;
+            if (peak_now <= IMBAL_GOAL_DEG) {
+                cue  = "good level";
+            } else if (peak_now <= IMBAL_WARN_DEG) {
+                cue  = "steady wrists";
+                flag = " • warning";
+                warn = true;
+            } else {
+                cue  = "re-level now";
+                flag = " • ALERT";
                 alert = true;
-        }
+            }
 
         snprintf(buf, sizeof(buf),
                  "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
@@ -856,7 +864,13 @@ static void update_labels_running(void)
 
         // Apply alert styling if needed
         lv_obj_remove_style_all(label_imbalance);
-        lv_obj_add_style(label_imbalance, alert ? &style_alert : &style_body, 0);
+        if (alert) {
+            lv_obj_add_style(label_imbalance, &style_alert, 0);
+        } else if (warn) {
+            lv_obj_add_style(label_imbalance, &style_warn, 0);
+        } else {
+            lv_obj_add_style(label_imbalance, &style_body, 0);
+        }
     }
 
     lvgl_port_unlock();
