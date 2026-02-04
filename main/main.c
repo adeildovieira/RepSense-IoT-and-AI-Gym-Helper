@@ -802,6 +802,10 @@ static void update_labels_idle(const char *reason)
         lv_label_set_text(label_imbalance, buf);
     }
 
+    if (label_quality) {
+        lv_label_set_text(label_quality, "Quality: --");
+    }
+
     lvgl_port_unlock();
 }
 
@@ -851,21 +855,21 @@ static void update_labels_running(void)
             dir = "level";
         }
 
-            const char *cue;
-            const char *flag = "";
-            bool alert = false;
-            bool warn  = false;
-            if (peak_now <= IMBAL_GOAL_DEG) {
-                cue  = "good level";
-            } else if (peak_now <= IMBAL_WARN_DEG) {
-                cue  = "steady wrists";
-                flag = " • warning";
-                warn = true;
-            } else {
-                cue  = "re-level now";
-                flag = " • ALERT";
-                alert = true;
-            }
+        const char *cue;
+        const char *flag = "";
+        bool alert = false;
+        bool warn  = false;
+        if (peak_now <= IMBAL_GOAL_DEG) {
+            cue  = "good level";
+        } else if (peak_now <= IMBAL_WARN_DEG) {
+            cue  = "steady wrists";
+            flag = " • warning";
+            warn = true;
+        } else {
+            cue  = "re-level now";
+            flag = " • ALERT";
+            alert = true;
+        }
 
         snprintf(buf, sizeof(buf),
                  "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
@@ -883,19 +887,33 @@ static void update_labels_running(void)
         }
     }
 
+    if (label_quality) {
+        int avg_quality = (sess_quality_count > 0)
+                        ? (int)((float)sess_sum_quality_pct / (float)sess_quality_count + 0.5f)
+                        : 0;
+        snprintf(buf, sizeof(buf), "Quality: last %d%% • avg %d%%",
+                 last_rep_quality_pct, avg_quality);
+        lv_label_set_text(label_quality, buf);
+    }
+
     lvgl_port_unlock();
 }
 
-static void update_labels_done(float total_time_s, float imbalance_avg_deg, float imbalance_max_deg)
+static void update_labels_done(float total_time_s,
+                               float imbalance_avg_deg,
+                               float imbalance_max_deg,
+                               float drift_deg,
+                               int avg_quality_pct)
 {
     if (!label_status || !label_time || !label_reps) return;
 
     char buf[160];
     lvgl_port_lock(0);
-                snprintf(buf, sizeof(buf),
-                         "Tilt %.1f° (%s)%s\nPeak %.1f° • goal ≤%.1f° • %s",
-                         angle_diff, dir, flag, peak_now, IMBAL_GOAL_DEG, cue);
-                lv_label_set_text(label_imbalance, buf);
+
+    snprintf(buf, sizeof(buf),
+             "Set done • Imbalance avg %.1f° (max %.1f°)\nDrift %.1f° (%s) • Press button to start",
+             imbalance_avg_deg, imbalance_max_deg,
+             drift_deg, (drift_deg > DRIFT_WARN_DEG) ? "re-level" : "ok");
     lv_label_set_text(label_status, buf);
 
     snprintf(buf, sizeof(buf), "Time: %.1f s", total_time_s);
@@ -907,6 +925,11 @@ static void update_labels_done(float total_time_s, float imbalance_avg_deg, floa
     if (label_imbalance) {
         snprintf(buf, sizeof(buf), "Next set goal: keep tilt ≤%.1f°", IMBAL_GOAL_DEG);
         lv_label_set_text(label_imbalance, buf);
+    }
+
+    if (label_quality) {
+        snprintf(buf, sizeof(buf), "Quality avg: %d%%", avg_quality_pct);
+        lv_label_set_text(label_quality, buf);
     }
 
     lvgl_port_unlock();
@@ -1147,7 +1170,7 @@ static void start_session(void)
     session_start_us = esp_timer_get_time();
     session_running  = true;
 
-    update_labels_idle("CALIBRATING...");
+    update_labels_idle("LEVEL BAR (5s)");
 }
 
 static void stop_session(void)
