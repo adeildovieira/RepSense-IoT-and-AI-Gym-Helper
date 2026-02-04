@@ -107,7 +107,8 @@ static bool              g_openai_body_valid = false;
 #define SAMPLE_PERIOD_MS           (1000 / SAMPLE_RATE_HZ)
 #define SAMPLE_PERIOD_S            (1.0f / (float)SAMPLE_RATE_HZ)
 
-#define CALIB_SAMPLES              100   //using ~1 s of calibration at 100 Hz
+#define CALIB_DURATION_S           5     // user holds level for 5 seconds
+#define CALIB_SAMPLES              (SAMPLE_RATE_HZ * CALIB_DURATION_S)
 
 // Optional debug (scans I2C bus at boot). Set to 1 only when debugging wiring.
 #define ENABLE_I2C_SCAN            0
@@ -132,6 +133,7 @@ static bool              g_openai_body_valid = false;
 // Imbalance guidance thresholds
 #define IMBAL_GOAL_DEG             3.0f     // target to stay within for good form
 #define IMBAL_WARN_DEG             6.0f     // warn user to re-level if above this
+#define DRIFT_WARN_DEG             4.0f     // baseline drift warning threshold
 
 // Direction labels for signed tilt (set for your mounting)
 // For bench press: if positive angle means left side drops, label pos as "left low"
@@ -470,6 +472,9 @@ static float          g_unit_z             = 0.0f;
 
 static float baseline_angle_deg = 0.0f;
 static float last_angle_deg     = 0.0f;
+static float baseline_start_angle_deg = 0.0f;
+static float baseline_end_angle_deg   = 0.0f;
+static float g_tilt_sign = 1.0f; // learned during calibration
 static volatile float g_live_angle_diff_deg = 0.0f;      // signed tilt vs baseline
 static volatile float g_live_angle_dev_deg  = 0.0f;      // abs tilt vs baseline (live)
 static volatile float g_live_peak_angle_dev_deg = 0.0f;  // peak abs tilt in current/last rep
@@ -499,6 +504,10 @@ static int   sess_peak_angle_count    = 0;     // number of counted reps contrib
 static float sess_sum_peak_jerk_gps   = 0.0f;  // sum of peak jerk per rep
 static float sess_max_peak_jerk_gps   = 0.0f;  // max peak jerk
 
+static int   last_rep_quality_pct     = 0;
+static int   sess_sum_quality_pct     = 0;
+static int   sess_quality_count       = 0;
+
 // Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
 static float g_motion_thresh_g     = VERT_MOTION_THRESH_G;
@@ -516,6 +525,7 @@ static lv_obj_t  *label_status = NULL;
 static lv_obj_t  *label_time   = NULL;
 static lv_obj_t  *label_reps   = NULL;
 static lv_obj_t  *label_imbalance = NULL;
+static lv_obj_t  *label_quality = NULL;
 static lv_obj_t  *label_footer = NULL;
 static lv_style_t style_title;
 static lv_style_t style_body;
@@ -940,6 +950,12 @@ static void create_main_screen(void)
     lv_obj_set_width(label_imbalance, EXAMPLE_LCD_H_RES - 32);
     lv_obj_align(label_imbalance, LV_ALIGN_TOP_MID, 0, 150);
 
+    label_quality = lv_label_create(card);
+    lv_obj_add_style(label_quality, &style_body, 0);
+    lv_label_set_long_mode(label_quality, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label_quality, EXAMPLE_LCD_H_RES - 32);
+    lv_obj_align(label_quality, LV_ALIGN_TOP_MID, 0, 190);
+
     label_footer = lv_label_create(card);
     lv_obj_add_style(label_footer, &style_body, 0);
     lv_label_set_long_mode(label_footer, LV_LABEL_LONG_WRAP);
@@ -1102,6 +1118,10 @@ static void reset_rep_state(void)
     g_live_angle_dev_deg = 0.0f;
     g_live_peak_angle_dev_deg = 0.0f;
     g_dir_state = 0;
+
+    last_rep_quality_pct = 0;
+    sess_sum_quality_pct = 0;
+    sess_quality_count   = 0;
 }
 
 static void start_session(void)
