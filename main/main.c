@@ -253,7 +253,7 @@ static esp_err_t wifi_connect_dukeopen(void)
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGW("WiFi", "failed to connect to SSID:%s", WIFI_SSID);
         return ESP_FAIL;
-    } else {
+    } else {    
         ESP_LOGW("WiFi", "Wi-Fi connect timeout");
         return ESP_FAIL;
     }
@@ -832,8 +832,7 @@ static void update_labels_running(void)
     lv_label_set_text(label_reps, buf);
 
     if (label_imbalance) {
-        float angle_now  = g_live_angle_dev_deg;
-        float angle_diff = g_live_angle_diff_deg;
+    float angle_diff = g_live_angle_diff_deg;
         float peak_now   = g_live_peak_angle_dev_deg;
         // Hysteresis to avoid flicker in direction label
         const float DIR_HIGH = 0.5f;
@@ -1195,6 +1194,9 @@ static void stop_session(void)
     float max_peak_angle = sess_peak_angle_count > 0 ? sess_max_peak_angle_deg
                                                     : fabsf(last_angle_deg - baseline_angle_deg);
 
+    baseline_end_angle_deg = last_angle_deg;
+    float drift_deg = fabsf(baseline_end_angle_deg - baseline_start_angle_deg);
+
     // Jerk stats (average of peak jerk per rep, and max)
     float avg_peak_jerk = (sess_peak_angle_count > 0)
                         ? (sess_sum_peak_jerk_gps / (float)sess_peak_angle_count)
@@ -1203,6 +1205,9 @@ static void stop_session(void)
 
     // Cadence (reps per minute)
     float cadence_rpm = (seconds > 0.0f) ? ((float)rep_count / seconds) * 60.0f : 0.0f;
+    int avg_quality_pct = (sess_quality_count > 0)
+                        ? (int)((float)sess_sum_quality_pct / (float)sess_quality_count + 0.5f)
+                        : 0;
 
     repsense_session_t sess = {
         .session_id        = ++g_session_counter,
@@ -1222,8 +1227,8 @@ static void stop_session(void)
     build_openai_chat_body(toon_buf, openai_body, sizeof(openai_body));
 
     ESP_LOGI(TAG,
-             "Session STOP: time = %.2f s, reps = %d, cadence=%.1f rpm, jerk avg/max=%.1f/%.1f g/s, imbalance avg/max=%.2f/%.2f deg",
-             seconds, rep_count, cadence_rpm, avg_peak_jerk, max_peak_jerk, avg_peak_angle, max_peak_angle);
+             "Session STOP: time = %.2f s, reps = %d, cadence=%.1f rpm, jerk avg/max=%.1f/%.1f g/s, imbalance avg/max=%.2f/%.2f deg, drift=%.2f deg, quality avg=%d%%",
+             seconds, rep_count, cadence_rpm, avg_peak_jerk, max_peak_jerk, avg_peak_angle, max_peak_angle, drift_deg, avg_quality_pct);
     ESP_LOGI(TAG, "Session TOON payload:\n%s", toon_buf);
     ESP_LOGI(TAG, "OpenAI Chat body:\n%s", openai_body);
 
@@ -1243,7 +1248,7 @@ static void stop_session(void)
         ESP_LOGW("OpenAI", "OpenAI task not ready; skipping request");
     }
 
-    update_labels_done(seconds, avg_peak_angle, max_peak_angle);
+    update_labels_done(seconds, avg_peak_angle, max_peak_angle, drift_deg, avg_quality_pct);
 }
 
 static void rep_update_from_vertical(float a_vert, float jerk_gps)
@@ -1314,8 +1319,23 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
                         sess_max_peak_jerk_gps = rep_peak_abs_jerk;
                     }
 
-                    ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg)",
-                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min, rep_peak_abs_angle_deg);
+                    // Rep quality score (0-100) using tilt + jerk stability
+                    float tilt_norm = rep_peak_abs_angle_deg / IMBAL_WARN_DEG;
+                    if (tilt_norm > 1.0f) tilt_norm = 1.0f;
+                    float jerk_norm = (jerk_min > 0.0f) ? (rep_peak_abs_jerk / (jerk_min * 2.0f)) : 0.0f;
+                    if (jerk_norm > 1.0f) jerk_norm = 1.0f;
+                    float tilt_score = 1.0f - tilt_norm;
+                    float jerk_score = 1.0f - jerk_norm;
+                    float quality = 0.6f * tilt_score + 0.4f * jerk_score;
+                    int quality_pct = (int)lrintf(quality * 100.0f);
+                    if (quality_pct < 0) quality_pct = 0;
+                    if (quality_pct > 100) quality_pct = 100;
+                    last_rep_quality_pct = quality_pct;
+                    sess_sum_quality_pct += quality_pct;
+                    sess_quality_count++;
+
+                    ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg, quality=%d%%)",
+                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min, rep_peak_abs_angle_deg, quality_pct);
                     } else {
                         ESP_LOGD(TAG, "Ignored rep (too close to previous): dt_us=%lld", (long long)(now_us - g_last_rep_time_us));
                     }
@@ -1430,6 +1450,8 @@ static void imu_task(void *arg)
 
                 baseline_angle_deg = compute_angle_deg(avg_ax, avg_ay, avg_az);
                 last_angle_deg     = baseline_angle_deg;
+                baseline_start_angle_deg = baseline_angle_deg;
+                g_tilt_sign = (g_unit_x >= 0.0f) ? 1.0f : -1.0f;
 
                 // Estimate noise (RMS per-axis) to adapt thresholds
                 float var_ax = fmaxf(0.0f, (calib_sum_sq_ax / (float)calib_count) - avg_ax * avg_ax);
@@ -1512,7 +1534,7 @@ static void imu_task(void *arg)
             g_prev_a_vert = a_vert;
 
             // Track per-rep peak absolute angle deviation continuously
-            float angle_diff = last_angle_deg - baseline_angle_deg; // signed
+            float angle_diff = (last_angle_deg - baseline_angle_deg) * g_tilt_sign; // signed
             float angle_dev  = fabsf(angle_diff);
             g_live_angle_diff_deg = angle_diff;
             g_live_angle_dev_deg  = angle_dev;
