@@ -479,8 +479,9 @@ static volatile float g_live_angle_diff_deg = 0.0f;      // signed tilt vs basel
 static volatile float g_live_angle_dev_deg  = 0.0f;      // abs tilt vs baseline (live)
 static volatile float g_live_peak_angle_dev_deg = 0.0f;  // peak abs tilt in current/last rep
 static int g_dir_state = 0; // -1 neg tilt, 0 level, +1 pos tilt (with hysteresis)
-static volatile float g_live_angle_dev_deg = 0.0f;
-static volatile float g_live_peak_angle_dev_deg = 0.0f;
+
+#define QUALITY_TREND_WINDOW 3
+#define QUALITY_TREND_TOTAL  (QUALITY_TREND_WINDOW * 2)
 
 static int   rep_count     = 0;
 
@@ -507,6 +508,10 @@ static float sess_max_peak_jerk_gps   = 0.0f;  // max peak jerk
 static int   last_rep_quality_pct     = 0;
 static int   sess_sum_quality_pct     = 0;
 static int   sess_quality_count       = 0;
+static int   g_quality_trend          = 0; // -1 down, 0 flat, +1 up
+static int   g_quality_hist[QUALITY_TREND_TOTAL] = {0};
+static int   g_quality_hist_count     = 0;
+static int   g_quality_hist_idx       = 0;
 
 // Adaptive thresholds (initialized to defaults, tuned after calibration based on noise)
 static float g_deadzone_thresh_g   = VERT_SIGN_DEADZONE_G;
@@ -890,8 +895,9 @@ static void update_labels_running(void)
         int avg_quality = (sess_quality_count > 0)
                         ? (int)((float)sess_sum_quality_pct / (float)sess_quality_count + 0.5f)
                         : 0;
-        snprintf(buf, sizeof(buf), "Quality: last %d%% • avg %d%%",
-                 last_rep_quality_pct, avg_quality);
+        const char *trend = (g_quality_trend > 0) ? "up" : (g_quality_trend < 0) ? "down" : "flat";
+        snprintf(buf, sizeof(buf), "Quality: last %d%% • avg %d%% • %s",
+                 last_rep_quality_pct, avg_quality, trend);
         lv_label_set_text(label_quality, buf);
     }
 
@@ -997,6 +1003,8 @@ typedef struct {
     float    cadence_rpm;        // reps per minute
     float    jerk_avg_gps;       // average peak jerk per rep
     float    jerk_max_gps;       // max peak jerk across reps
+    int      quality_avg_pct;    // average quality score (0-100)
+    int      quality_trend;      // -1 down, 0 flat, +1 up
 } repsense_session_t;
 
 static uint32_t g_session_counter = 0;
@@ -1020,7 +1028,9 @@ static void build_session_toon(const repsense_session_t *s,
              "imbalance_max_deg: %.2f\n"
              "cadence_rpm: %.2f\n"
              "jerk_avg_gps: %.2f\n"
-             "jerk_max_gps: %.2f\n",
+             "jerk_max_gps: %.2f\n"
+             "quality_avg_pct: %d\n"
+             "quality_trend: %s\n",
              REPSENSE_FW_VERSION,
              REPSENSE_EXERCISE,
              (unsigned long)s->session_id,
@@ -1030,7 +1040,9 @@ static void build_session_toon(const repsense_session_t *s,
              s->imbalance_max_deg,
              s->cadence_rpm,
              s->jerk_avg_gps,
-             s->jerk_max_gps);
+             s->jerk_max_gps,
+             s->quality_avg_pct,
+             (s->quality_trend > 0) ? "up" : (s->quality_trend < 0) ? "down" : "flat");
 }
 
 static void json_escape_string(const char *in, char *out, size_t out_size)
@@ -1094,7 +1106,7 @@ static void build_openai_chat_body(const char *toon,
 
     const char *system_prompt =
         "You are RepSense, an on-device strength coach. "
-        "Input: 'RepSenseToon v1' with fields session_id, fw_version, exercise, time_s (session duration), reps (count), cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (smoother when lower), imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (worst per-rep peak tilt). "
+    "Input: 'RepSenseToon v1' with fields session_id, fw_version, exercise, time_s (session duration), reps (count), cadence_rpm (reps/min), jerk_avg_gps and jerk_max_gps (smoother when lower), imbalance_deg (avg per-rep peak tilt), imbalance_max_deg (worst per-rep peak tilt), quality_avg_pct (0-100), quality_trend (up/down/flat). "
         "Rules: no questions, no invented data, use only these numbers. If reps == 0 or time_s < 5, say data too short to judge and give one quick setup tip. Otherwise respond as exactly 3 short bullet points (<=18 words each): "
         "1) Pace + stability using cadence_rpm and jerk values (smooth/jerky, slow/ok/fast). "
         "2) Imbalance with average tilt and clear worst-case callout if imbalance_max_deg exceeds imbalance_deg. "
@@ -1144,6 +1156,12 @@ static void reset_rep_state(void)
     last_rep_quality_pct = 0;
     sess_sum_quality_pct = 0;
     sess_quality_count   = 0;
+    g_quality_trend      = 0;
+    g_quality_hist_count = 0;
+    g_quality_hist_idx   = 0;
+    for (int i = 0; i < QUALITY_TREND_TOTAL; ++i) {
+        g_quality_hist[i] = 0;
+    }
 }
 
 static void start_session(void)
@@ -1218,6 +1236,8 @@ static void stop_session(void)
         .cadence_rpm       = cadence_rpm,
         .jerk_avg_gps      = avg_peak_jerk,
         .jerk_max_gps      = max_peak_jerk,
+        .quality_avg_pct   = avg_quality_pct,
+        .quality_trend     = g_quality_trend,
     };
 
     char toon_buf[256];
@@ -1334,8 +1354,35 @@ static void rep_update_from_vertical(float a_vert, float jerk_gps)
                     sess_sum_quality_pct += quality_pct;
                     sess_quality_count++;
 
-                    ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg, quality=%d%%)",
-                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min, rep_peak_abs_angle_deg, quality_pct);
+                    // Update rolling quality trend (last 3 reps vs previous 3)
+                    g_quality_hist[g_quality_hist_idx] = quality_pct;
+                    g_quality_hist_idx = (g_quality_hist_idx + 1) % QUALITY_TREND_TOTAL;
+                    if (g_quality_hist_count < QUALITY_TREND_TOTAL) {
+                        g_quality_hist_count++;
+                    }
+                    if (g_quality_hist_count >= QUALITY_TREND_TOTAL) {
+                        int sum_recent = 0;
+                        int sum_prev = 0;
+                        for (int i = 0; i < QUALITY_TREND_WINDOW; ++i) {
+                            int idx_recent = (g_quality_hist_idx - 1 - i + QUALITY_TREND_TOTAL) % QUALITY_TREND_TOTAL;
+                            int idx_prev = (g_quality_hist_idx - 1 - QUALITY_TREND_WINDOW - i + QUALITY_TREND_TOTAL) % QUALITY_TREND_TOTAL;
+                            sum_recent += g_quality_hist[idx_recent];
+                            sum_prev += g_quality_hist[idx_prev];
+                        }
+                        int diff = (sum_recent / QUALITY_TREND_WINDOW) - (sum_prev / QUALITY_TREND_WINDOW);
+                        if (diff >= 5) {
+                            g_quality_trend = 1;
+                        } else if (diff <= -5) {
+                            g_quality_trend = -1;
+                        } else {
+                            g_quality_trend = 0;
+                        }
+                    } else {
+                        g_quality_trend = 0;
+                    }
+
+                    ESP_LOGI(TAG, "Rep %d (|a_vert|=%.3f g, |jerk|=%.1f g/s>=%.1f, peak angle dev=%.2f deg, quality=%d%%, trend=%d)",
+                             rep_count, rep_peak_abs_vert, rep_peak_abs_jerk, jerk_min, rep_peak_abs_angle_deg, quality_pct, g_quality_trend);
                     } else {
                         ESP_LOGD(TAG, "Ignored rep (too close to previous): dt_us=%lld", (long long)(now_us - g_last_rep_time_us));
                     }
