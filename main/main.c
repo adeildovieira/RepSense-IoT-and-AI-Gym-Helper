@@ -259,6 +259,59 @@ static esp_err_t wifi_connect_dukeopen(void)
     }
 }
 
+// Extract the "content" value from an OpenAI chat completion JSON response.
+// Writes the unescaped text into `out` (up to out_size-1 chars).
+// Returns true on success, false if the field was not found.
+static bool extract_openai_content(const char *json, char *out, size_t out_size)
+{
+    if (!json || !out || out_size == 0) return false;
+    out[0] = '\0';
+
+    // Look for "content":" (with optional space after colon)
+    const char *key = "\"content\"";
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    p += strlen(key);
+
+    // skip whitespace and colon
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '\"') return false;
+    p++; // skip opening quote
+
+    size_t o = 0;
+    while (*p && *p != '\"' && o + 1 < out_size) {
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            switch (*p) {
+            case 'n':  out[o++] = '\n'; break;
+            case 'r':  out[o++] = '\r'; break;
+            case 't':  out[o++] = '\t'; break;
+            case '\"': out[o++] = '\"'; break;
+            case '\\': out[o++] = '\\'; break;
+            default:   out[o++] = *p;   break;
+            }
+        } else {
+            out[o++] = *p;
+        }
+        p++;
+    }
+    out[o] = '\0';
+    return o > 0;
+}
+
+// Show AI coaching feedback on the LCD status label (called from openai_task context)
+static void ui_show_ai_feedback(const char *feedback)
+{
+    if (!label_status || !feedback || feedback[0] == '\0') return;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "AI Coach:\n%s", feedback);
+
+    lvgl_port_lock(0);
+    lv_label_set_text(label_status, buf);
+    lvgl_port_unlock();
+}
+
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -316,7 +369,9 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     ESP_LOGI(TAG_OPENAI, "=== Sending request to OpenAI API ===");
     ESP_LOGI(TAG_OPENAI, "Waiting for AI response...");
     ui_set_footer("Wi-Fi on • AI requesting");
-    
+
+    time_t now;
+    struct tm timeinfo;
     time(&now);
     localtime_r(&now, &timeinfo);
     ESP_LOGI(TAG_OPENAI, "System time: %04d-%02d-%02d %02d:%02d:%02d",
@@ -422,7 +477,16 @@ static esp_err_t openai_send_chat_request(const char *json_body)
     ESP_LOGI(TAG_OPENAI, "Response: %s", body);
     ESP_LOGI(TAG_OPENAI, "======================================");
 
-    ui_set_footer("Wi-Fi on • AI ready");
+    // Parse the AI response and display coaching feedback on the LCD
+    char ai_content[512];
+    if (extract_openai_content(body, ai_content, sizeof(ai_content))) {
+        ESP_LOGI(TAG_OPENAI, "AI feedback: %s", ai_content);
+        ui_show_ai_feedback(ai_content);
+        ui_set_footer("Wi-Fi on • AI done");
+    } else {
+        ESP_LOGW(TAG_OPENAI, "Could not parse content from OpenAI response");
+        ui_set_footer("Wi-Fi on • AI parse error");
+    }
 
     esp_http_client_cleanup(client);
     return ESP_OK;
@@ -1450,9 +1514,19 @@ static void imu_task(void *arg)
 
             baseline_ready   = false;
             reset_rep_state();
+            quiet_count = 0;
 
             prev_running  = true;
             ESP_LOGI(TAG, "Calibration phase started");
+
+            // Seed the low-pass filter with the first reading so it doesn't
+            // ramp up from zero during calibration.
+            float seed_ax, seed_ay, seed_az;
+            if (imu_read_accel(&seed_ax, &seed_ay, &seed_az) == ESP_OK) {
+                filt_ax = seed_ax;
+                filt_ay = seed_ay;
+                filt_az = seed_az;
+            }
         }
 
         float ax_g, ay_g, az_g;
@@ -1464,11 +1538,7 @@ static void imu_task(void *arg)
         }
 
         // Low-pass filter to smooth noise and reduce false rep triggers
-        if (calib_count == 0 && !baseline_ready && !prev_running) {
-            filt_ax = ax_g;
-            filt_ay = ay_g;
-            filt_az = az_g;
-        } else {
+        {
             filt_ax = ACC_LPF_ALPHA * ax_g + (1.0f - ACC_LPF_ALPHA) * filt_ax;
             filt_ay = ACC_LPF_ALPHA * ay_g + (1.0f - ACC_LPF_ALPHA) * filt_ay;
             filt_az = ACC_LPF_ALPHA * az_g + (1.0f - ACC_LPF_ALPHA) * filt_az;
